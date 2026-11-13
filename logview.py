@@ -3,9 +3,9 @@
 
 ใช้งาน:
     python logview.py app.log
-    node app.js | python logview.py
-    python logview.py --run node app.js
-    python logview.py --demo
+    pm2 logs --raw | logview
+    logview --run "pm2 logs --raw"
+    logview --demo
 
 เมาส์:  ลากคลุม (ลากเลยขอบจอแล้วเลื่อนตามอัตโนมัติ) = คัดลอกทันที
         ดับเบิลคลิก = เลือกคำ / ทริปเปิลคลิก = เลือกทั้งบรรทัด / คลิกเฉยๆ = ล้างการคลุม
@@ -23,6 +23,10 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
+
+# เปิดสีครบทุกเฉดแม้ใช้งานผ่าน SSH บน Linux (หากไม่ได้ตั้ง NO_COLOR)
+if "NO_COLOR" not in os.environ:
+    os.environ.setdefault("COLORTERM", "truecolor")
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -45,19 +49,34 @@ AUTOSCROLL_MAX_LINES = 12        # เลื่อนเร็วสุดต่
 SELECTION_STYLE = "bold white on #2563eb"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-# ลำดับ escape ที่ไม่ใช่สี (เลื่อนเคอร์เซอร์, ล้างบรรทัด ฯลฯ) - ตัดทิ้งก่อนส่งให้ Rich
 NON_SGR_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-ln-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 WORD_RE = re.compile(r"[\w./:\-@\\]+", re.UNICODE)
 
-ERROR_RE = re.compile(
-    r"ERROR|EXCEPTION|\b(?:ERR|FATAL|CRITICAL|TRACEBACK|FAIL(?:ED|URE)?)\b", re.I
-)
-WARN_RE = re.compile(r"\bWARN(?:ING)?\b", re.I)
-OK_RE = re.compile(r"\b(?:SUCCESS|OK|READY|CONNECTED|LISTENING)\b|\s200\s", re.I)
-DEBUG_RE = re.compile(r"\bDEBUG\b", re.I)
+# จับรูปแบบเวลา รวมถึง ISO8601 ที่ลงท้ายด้วย Z หรือ +07:00
 TS_RE = re.compile(
-    r"^(\[?\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?\]?|\[?\d{2}:\d{2}:\d{2}\]?)\s*(.*)"
+    r"^(\[?\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?|\[?\d{2}:\d{2}:\d{2}(?:\.\d+)?\]?)\s*(.*)"
 )
+# จับแท็กนำหน้า เช่น [telegram] [config] [PM2]
+TAG_RE = re.compile(r"^(\[[^\]\r\n]{1,32}\])\s*(.*)")
+# จับระดับ Log ชัดเจนที่ต้นข้อความ เช่น ERR, WRN, INF, ERROR, WARN, INFO
+LEVEL_RE = re.compile(
+    r"^(ERR(?:OR)?|FATAL|CRITICAL|WRN|WARN(?:ING)?|INF(?:O)?|DBG|DEBUG)\b\s*(.*)",
+    re.I,
+)
+
+ERROR_RE = re.compile(
+    r"ERROR|EXCEPTION|\b(?:ERR|FATAL|CRITICAL|TRACEBACK|FAIL(?:ED|URE)?|ECONNREFUSED|ETIMEDOUT)\b|Bad Request|พัง|ผิดพลาด|ล้มเหลว",
+    re.I,
+)
+WARN_RE = re.compile(
+    r"\b(?:WRN|WARN(?:ING)?|Retrying|disconnected)\b|⚠|Lost connection|เตือน|ระวัง",
+    re.I,
+)
+OK_RE = re.compile(
+    r"\b(?:SUCCESS|OK|READY|CONNECTED|LISTENING|Registered)\b|\s200\s|สำเร็จ",
+    re.I,
+)
+DEBUG_RE = re.compile(r"\b(?:DBG|DEBUG)\b", re.I)
 
 
 class StatusBar(Static):
@@ -71,7 +90,7 @@ def strip_ansi(text: str) -> str:
 
 def clean_line(raw: str) -> str:
     line = raw.rstrip("\r\n")
-    if "\r" in line:  # progress bar แบบ \r เอาเฉพาะข้อความสุดท้าย
+    if "\r" in line:
         line = line.rsplit("\r", 1)[-1]
     return line.replace("\t", "    ").replace("\x00", "")
 
@@ -83,35 +102,64 @@ def split_lines(text: str) -> list[str]:
     return [p + "\n" for p in parts]
 
 
+def _classify_body_style(body: str) -> str:
+    if ERROR_RE.search(body):
+        return "bold red"
+    if WARN_RE.search(body):
+        return "bold yellow"
+    if OK_RE.search(body):
+        return "green"
+    if DEBUG_RE.search(body):
+        return "dim white"
+    return "white"
+
+
 def style_log_line(raw_line: str, keyword: str = "") -> Text:
-    """ลงสี Log อัตโนมัติ (รองรับทั้งข้อความดิบและสี ANSI จากต้นทาง)"""
+    """ลงสี Log อัตโนมัติ (รองรับทั้งสี ANSI จากต้นทาง และข้อความดิบจาก Pipe/ไฟล์)"""
     clean = clean_line(raw_line)
 
     if "\x1b[" in clean:
         text = Text.from_ansi(NON_SGR_RE.sub("", clean))
     else:
         text = Text()
-        ts_match = TS_RE.match(clean)
+        rest = clean
+
+        # 1. ส่วนวันที่/เวลา
+        ts_match = TS_RE.match(rest)
         if ts_match:
             text.append(ts_match.group(1) + " ", style="dim cyan")
-            body = ts_match.group(2)
-        else:
-            body = clean
+            rest = ts_match.group(2)
 
-        if ERROR_RE.search(body):
-            style = "bold red"
-        elif WARN_RE.search(body):
-            style = "bold yellow"
-        elif OK_RE.search(body):
-            style = "green"
-        elif DEBUG_RE.search(body):
-            style = "dim white"
+        # 2. แท็กนำหน้า เช่น [telegram] [config]
+        tag_match = TAG_RE.match(rest)
+        if tag_match:
+            text.append(tag_match.group(1) + " ", style="bold magenta")
+            rest = tag_match.group(2)
+
+        # 3. ระดับ Log ชัดเจน (ERR / WRN / INF / DEBUG)
+        lvl_match = LEVEL_RE.match(rest)
+        if lvl_match:
+            lvl_token = lvl_match.group(1)
+            msg_body = lvl_match.group(2)
+            lvl_upper = lvl_token.upper()
+
+            if lvl_upper.startswith(("ERR", "FATAL", "CRIT")):
+                text.append(lvl_token + " ", style="bold red")
+                text.append(msg_body, style="bold red")
+            elif lvl_upper.startswith("W"):
+                text.append(lvl_token + " ", style="bold yellow")
+                text.append(msg_body, style="yellow")
+            elif lvl_upper.startswith("I"):
+                text.append(lvl_token + " ", style="bold cyan")
+                text.append(msg_body, style=_classify_body_style(msg_body))
+            else:
+                text.append(lvl_token + " ", style="dim white")
+                text.append(msg_body, style="dim white")
         else:
-            style = "white"
-        text.append(body, style=style)
+            text.append(rest, style=_classify_body_style(rest))
 
     if not text.plain.strip():
-        return Text(" ")  # บรรทัดว่างยังต้องกินพื้นที่ 1 แถว
+        return Text(" ")
 
     if keyword:
         text.highlight_words([keyword], style="bold black on yellow", case_sensitive=False)
@@ -187,7 +235,7 @@ def copy_to_clipboard_cross_platform(app: App, text: str) -> bool:
 
     osc_ok = False
     try:
-        app.copy_to_clipboard(text)  # OSC 52 ผ่านเทอร์มินัล
+        app.copy_to_clipboard(text)
         osc_ok = True
     except Exception:
         pass
@@ -229,7 +277,7 @@ def copy_to_clipboard_cross_platform(app: App, text: str) -> bool:
     return system_ok or osc_ok
 
 
-# ---------------------------------------------------------------- subprocess helpers
+# ---------------------------------------------------------------- subprocess & pipe cleanup
 def _force_kill(proc: subprocess.Popen) -> None:
     try:
         if proc.poll() is None:
@@ -264,13 +312,58 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
             pass
 
 
+def _find_pipe_writers(pipe_inode: int) -> list[int]:
+    """ค้นหา PID ของโปรแกรมต้นทางที่ส่งข้อมูลเข้าท่อ Pipe นี้ (เฉพาะ Linux)"""
+    if not pipe_inode or not os.path.isdir("/proc"):
+        return []
+    my_pid = os.getpid()
+    target = f"pipe:[{pipe_inode}]"
+    writers: list[int] = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == my_pid:
+                continue
+            fd_dir = f"/proc/{pid}/fd"
+            try:
+                for fd_name in os.listdir(fd_dir):
+                    try:
+                        if os.readlink(f"{fd_dir}/{fd_name}") == target:
+                            writers.append(pid)
+                            break
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return writers
+
+
+def cleanup_pipe_writers(pipe_inode: int | None) -> None:
+    """ปิดโปรเซสต้นทางของท่อ Pipe เมื่อออกจาก logview เพื่อไม่ให้ค้างพิมพ์ทับ Terminal"""
+    if not pipe_inode:
+        return
+    pids = _find_pipe_writers(pipe_inode)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if pids:
+        time.sleep(0.15)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------- log widget
 class LogView(ScrollView, can_focus=True):
-    """แสดง Log แบบ virtual rendering + ระบบคลุมข้อความของตัวเอง
-
-    ตำแหน่งที่คลุมเก็บเป็น (หมายเลขบรรทัดสะสม, ตำแหน่งตัวอักษร) ไม่ผูกกับ widget
-    จึงไม่หลุดเมื่อมี log ใหม่เข้า / ตัดบรรทัดเก่า / เลื่อนจอ / ลากเลยขอบจอ
-    """
+    """แสดง Log แบบ virtual rendering + ระบบคลุมข้อความของตัวเอง"""
 
     allow_select = False
 
@@ -304,9 +397,8 @@ class LogView(ScrollView, can_focus=True):
         self._last_x = 0
         self._last_y = 0
         self._drag_timer = None
-        self._edge_ticks = 0  # นับรอบที่เมาส์ค้างพ้นขอบ ใช้เร่งความเร็วเลื่อน
+        self._edge_ticks = 0
 
-    # ---------------------------------------------------------- data
     def _sync_size(self) -> None:
         self.virtual_size = Size(max(self._max_cells, 1), len(self._texts))
 
@@ -326,7 +418,6 @@ class LogView(ScrollView, can_focus=True):
             del self._copy[:removed]
         self._sync_size()
         if removed > 0 and not self.follow:
-            # บรรทัดบนหายไป เลื่อนชดเชยให้ภาพที่ผู้ใช้กำลังดู/คลุมอยู่ไม่ขยับ
             self._adjusting = True
             try:
                 self.scroll_to(y=max(0, self.scroll_y - removed), animate=False)
@@ -356,7 +447,6 @@ class LogView(ScrollView, can_focus=True):
         self.scroll_home(animate=False)
         self.refresh()
 
-    # ---------------------------------------------------------- scrolling
     def watch_scroll_y(self, old_value: float, new_value: float) -> None:
         super().watch_scroll_y(old_value, new_value)
         if self._dragging or self._adjusting:
@@ -370,7 +460,6 @@ class LogView(ScrollView, can_focus=True):
         self.follow = True
         self.scroll_end(animate=False)
 
-    # ---------------------------------------------------------- rendering
     def _index_of(self, pos: tuple[int, int]) -> tuple[int, int]:
         seq, col = pos
         n = len(self._ids)
@@ -416,7 +505,6 @@ class LogView(ScrollView, can_focus=True):
         strip = strip.crop_extend(scroll_x, scroll_x + width, self.rich_style)
         return strip.apply_style(self.rich_style)
 
-    # ---------------------------------------------------------- selection API
     @property
     def has_selection(self) -> bool:
         return self._selection_range() is not None
@@ -438,7 +526,6 @@ class LogView(ScrollView, can_focus=True):
         parts.append(self._copy[i2][:c2])
         return "\n".join(parts)
 
-    # ---------------------------------------------------------- mouse
     def _pos_at(self, x: float, y: float) -> tuple[int, int] | None:
         n = len(self._ids)
         if n == 0:
@@ -481,7 +568,7 @@ class LogView(ScrollView, can_focus=True):
         if pos is None:
             return
         self._last_x, self._last_y = event.x, event.y
-        self.follow = False  # ล็อกหน้าจอ: log ใหม่ไม่ดันภาพระหว่างคลุม
+        self.follow = False
         self._anchor = self._cursor = pos
         self._dragging = True
         self._edge_ticks = 0
@@ -498,7 +585,6 @@ class LogView(ScrollView, can_focus=True):
         self._update_cursor_from_pointer()
 
     def _drag_tick(self) -> None:
-        """เลื่อนจออัตโนมัติเมื่อกดเมาส์ค้างแล้วลากพ้นขอบบน/ล่าง แม้เมาส์ไม่ขยับ"""
         if not self._dragging:
             return
         height = self.size.height
@@ -510,7 +596,6 @@ class LogView(ScrollView, can_focus=True):
             self._edge_ticks = 0
             return
         self._edge_ticks += 1
-        # ยิ่งค้างนาน/ลากพ้นขอบไกล ยิ่งเลื่อนเร็ว (ลากข้ามบัฟเฟอร์ 2000 บรรทัดได้ในไม่กี่วินาที)
         step = direction * min(1 + dist + self._edge_ticks // 4, AUTOSCROLL_MAX_LINES)
         target = min(max(self.scroll_y + step, 0), self.max_scroll_y)
         if target != self.scroll_y:
@@ -518,7 +603,6 @@ class LogView(ScrollView, can_focus=True):
         self._update_cursor_from_pointer()
 
     def on_click(self, event: events.Click) -> None:
-        """ดับเบิลคลิก = เลือกคำ / ทริปเปิลคลิก = เลือกทั้งบรรทัด (Textual ส่ง chain มากับ Click)"""
         chain = getattr(event, "chain", 1)
         if event.button != 1 or chain < 2:
             return
@@ -553,7 +637,7 @@ class LogView(ScrollView, can_focus=True):
         if text:
             self.post_message(self.Selected(text))
         else:
-            self.clear_selection()  # คลิกเฉยๆ = ล้างการคลุม
+            self.clear_selection()
 
 
 # ---------------------------------------------------------------- app
@@ -579,7 +663,7 @@ class LogViewerApp(App):
     }
     """
 
-    ALLOW_SELECT = False  # ปิดระบบคลุมของ Textual แล้วใช้ LogView ที่คลุมเองแทน
+    ALLOW_SELECT = False
 
     BINDINGS = [
         Binding("space", "toggle_pause", "Pause/Live"),
@@ -607,10 +691,8 @@ class LogViewerApp(App):
         self.piped_stream = piped_stream
         self.demo_mode = demo or not any((file_path, run_cmd, piped_stream))
 
-        # (หมายเลขบรรทัดสะสม, ข้อความดิบ) - หมายเลขใช้ยึดตำแหน่งที่คลุมไว้
         self.lines: deque[tuple[int, str]] = deque(maxlen=MAX_BUFFER_LINES)
         self._seq = 0
-        # คิวรับบรรทัดจากเธรดอื่น (deque.append ปลอดภัยข้ามเธรด) - UI ดึงไปวาดเป็นชุดด้วย timer
         self._incoming: deque[str] = deque(maxlen=INCOMING_LIMIT)
         self.file_pos = 0
         self.paused = False
@@ -620,7 +702,6 @@ class LogViewerApp(App):
         self._proc_lock = threading.Lock()
         self._proc_gen = 0
 
-    # ------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield StatusBar("", id="status-bar")
@@ -657,11 +738,15 @@ class LogViewerApp(App):
 
     def on_unmount(self) -> None:
         self.stop_subprocess()
+        if self.piped_stream:
+            try:
+                self.piped_stream.close()
+            except Exception:
+                pass
 
     def _view(self) -> LogView:
         return self.query_one("#log-scroll", LogView)
 
-    # ------------------------------------------------------------ subprocess (--run)
     def start_subprocess(self) -> None:
         self.stop_subprocess()
         if not self.run_cmd:
@@ -676,12 +761,12 @@ class LogViewerApp(App):
         def _worker() -> None:
             try:
                 env = os.environ.copy()
-                env.setdefault("FORCE_COLOR", "1")        # ให้ Node/เครื่องมืออื่นส่งสีแม้ออกทางท่อ
-                env.setdefault("PYTHONUNBUFFERED", "1")   # โปรแกรม Python ไม่หน่วงบัฟเฟอร์
+                env.setdefault("FORCE_COLOR", "1")
+                env.setdefault("PYTHONUNBUFFERED", "1")
                 env.setdefault("PYTHONIOENCODING", "utf-8")
                 kwargs = {
                     "shell": True,
-                    "stdin": subprocess.DEVNULL,  # กันโปรเซสลูกแย่งคีย์บอร์ดจาก TUI
+                    "stdin": subprocess.DEVNULL,
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.STDOUT,
                     "text": True,
@@ -695,7 +780,7 @@ class LogViewerApp(App):
 
                 proc = subprocess.Popen(self.run_cmd, **kwargs)
                 with self._proc_lock:
-                    if gen != self._proc_gen:  # ถูกสั่งหยุด/รีสตาร์ทระหว่างสตาร์ท
+                    if gen != self._proc_gen:
                         terminate_process_tree(proc)
                         return
                     self._proc = proc
@@ -721,7 +806,7 @@ class LogViewerApp(App):
 
     def stop_subprocess(self) -> None:
         with self._proc_lock:
-            self._proc_gen += 1  # ทำให้ worker เก่าทุกตัวเลิกส่งข้อมูลเข้าจอ
+            self._proc_gen += 1
             proc = self._proc
             self._proc = None
         if proc:
@@ -734,16 +819,14 @@ class LogViewerApp(App):
         self.notify("กำลังรีสตาร์ทโปรเซส...", timeout=1.5)
         self.start_subprocess()
 
-    # ------------------------------------------------------------ pipe reader
     def _read_pipe_worker(self) -> None:
         try:
             for line in self.piped_stream:
                 self._incoming.append(line)
             self._incoming.append("[INFO] Stream ended (EOF)\n")
-        except Exception as e:
-            self._incoming.append(f"[ERROR] อ่าน pipe ไม่ได้: {e}\n")
+        except Exception:
+            pass
 
-    # ------------------------------------------------------------ filtering / status
     def update_status_bar(self) -> None:
         state = "⏸ PAUSED" if self.paused else "● LIVE"
         mode = " [ERROR ONLY]" if self.error_only else ""
@@ -762,7 +845,6 @@ class LogViewerApp(App):
             return False
         return True
 
-    # ------------------------------------------------------------ ingest / render
     def _store(self, raw_lines: list[str]) -> list[tuple[int, str]]:
         entries = []
         for raw in raw_lines:
@@ -808,7 +890,6 @@ class LogViewerApp(App):
         self._view().set_items(visible)
         self.update_status_bar()
 
-    # ------------------------------------------------------------ file mode
     def load_initial_tail(self) -> None:
         path = self.file_path
         if not path or not os.path.exists(path):
@@ -823,7 +904,7 @@ class LogViewerApp(App):
             self._incoming.append(f"[ERROR] เปิดไฟล์ไม่ได้: {e}\n")
             return
 
-        if start > 0:  # เริ่มกลางไฟล์: ทิ้งบรรทัดแรกที่อาจขาดครึ่ง
+        if start > 0:
             nl = data.find(b"\n")
             if nl == -1:
                 self.file_pos = size
@@ -852,7 +933,7 @@ class LogViewerApp(App):
                 f.seek(self.file_pos)
                 data = f.read(min(size - self.file_pos, READ_CHUNK_BYTES))
             last = data.rfind(b"\n")
-            if last == -1:  # ยังเขียนไม่จบบรรทัด รอรอบหน้า
+            if last == -1:
                 return
             complete = data[: last + 1]
             self.file_pos += len(complete)
@@ -860,7 +941,6 @@ class LogViewerApp(App):
         except OSError:
             pass
 
-    # ------------------------------------------------------------ demo
     def generate_demo_log(self) -> None:
         samples = [
             "INFO  Worker #1 connected to database successfully",
@@ -873,7 +953,6 @@ class LogViewerApp(App):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._incoming.append(f"{now} {random.choice(samples)}\n")
 
-    # ------------------------------------------------------------ selection & clipboard
     def _get_selected_text(self) -> str:
         try:
             text = self._view().get_selected_text()
@@ -933,7 +1012,6 @@ class LogViewerApp(App):
             return
         self.notify(f"บันทึกแล้ว: {path}", timeout=5)
 
-    # ------------------------------------------------------------ keybindings
     def action_toggle_pause(self) -> None:
         self.paused = not self.paused
         if not self.paused:
@@ -983,11 +1061,17 @@ class LogViewerApp(App):
 
 # ---------------------------------------------------------------- entry
 def setup_piped_stdin():
-    """แยกท่อ Pipe ออกจาก stdin แล้วคืนค่าคีย์บอร์ด/เมาส์ให้ Terminal"""
+    """แยกท่อ Pipe ออกจาก stdin แล้วคืนค่าคีย์บอร์ด/เมาส์ให้ Terminal (คืน stream, pipe_inode)"""
     if sys.stdin.isatty():
-        return None
+        return None, None
     try:
         pipe_fd = os.dup(0)
+        pipe_inode = None
+        if os.name != "nt":
+            try:
+                pipe_inode = os.fstat(pipe_fd).st_ino
+            except OSError:
+                pass
         piped_stream = os.fdopen(pipe_fd, "r", encoding="utf-8", errors="replace")
         tty_path = "CONIN$" if os.name == "nt" else "/dev/tty"
         tty_fd = os.open(tty_path, os.O_RDWR if os.name == "nt" else os.O_RDONLY)
@@ -998,9 +1082,9 @@ def setup_piped_stdin():
             import msvcrt
 
             ctypes.windll.kernel32.SetStdHandle(-10, msvcrt.get_osfhandle(0))
-        return piped_stream
+        return piped_stream, pipe_inode
     except OSError:
-        return None
+        return None, None
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1023,15 +1107,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 if __name__ == "__main__":
     cli = parse_args(sys.argv[1:])
 
-    piped = setup_piped_stdin()
+    piped, pipe_inode = setup_piped_stdin()
     if piped and (cli.file or cli.run or cli.demo):
         piped.close()
+        cleanup_pipe_writers(pipe_inode)
         piped = None
+        pipe_inode = None
 
-    LogViewerApp(
-        file_path=cli.file,
-        run_cmd=" ".join(cli.run) if cli.run else None,
-        piped_stream=piped,
-        demo=cli.demo,
-    ).run()
-
+    try:
+        LogViewerApp(
+            file_path=cli.file,
+            run_cmd=" ".join(cli.run) if cli.run else None,
+            piped_stream=piped,
+            demo=cli.demo,
+        ).run()
+    finally:
+        cleanup_pipe_writers(pipe_inode)
