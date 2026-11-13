@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""จัดการสี Log, ภาษาไทย/อีโมจิ (Grapheme), Clipboard ข้ามระบบ และค้นหาโปรเซส PM2"""
+"""จัดการสี Log, ภาษาไทย/อีโมจิ (Grapheme), JSON Pretty-Print, Exclude Filter และ Clipboard"""
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -16,7 +17,6 @@ if "NO_COLOR" not in os.environ:
     os.environ.setdefault("COLORTERM", "truecolor")
 os.environ.setdefault("PYTHONUTF8", "1")
 
-# บังคับ stdout/stderr เป็น UTF-8 เพื่อไม่ให้ภาษาไทย/อีโมจิเพี้ยนบน Windows และ Linux
 for _stream in (sys.stdout, sys.stderr):
     try:
         if hasattr(_stream, "reconfigure"):
@@ -34,7 +34,6 @@ READ_CHUNK_BYTES = 4 * 1024 * 1024
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 NON_SGR_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-ln-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-# รองรับคำภาษาไทย (รวมสระ/วรรณยุกต์) ภาษาอังกฤษ ตัวเลข และสัญลักษณ์ไฟล์/URL
 WORD_RE = re.compile(r"[\w\u0E00-\u0E7F./:\-@\\]+", re.UNICODE)
 
 TS_RE = re.compile(
@@ -60,6 +59,10 @@ OK_RE = re.compile(
 )
 DEBUG_RE = re.compile(r"\b(?:DBG|DEBUG)\b", re.I)
 
+JSON_KEY_RE = re.compile(r'("(?:\\.|[^"\\])*")\s*:')
+JSON_STR_VAL_RE = re.compile(r':\s*("(?:\\.|[^"\\])*")')
+JSON_PRIM_VAL_RE = re.compile(r":\s*(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)\b")
+
 BADGE_PALETTE = [
     "bold bright_cyan",
     "bold bright_magenta",
@@ -72,16 +75,14 @@ BADGE_PALETTE = [
 
 # ---------------------------------------------------------------- Thai & Emoji Grapheme Helpers
 def _is_combining_or_modifier(ch: str) -> bool:
-    """เช็กว่าเป็นสระลอย/วรรณยุกต์ไทย, Variation Selector หรือตัวปรับสีผิวอีโมจิหรือไม่"""
     cp = ord(ch)
-    if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:  # Variation Selectors (เช่น ⚠️)
+    if 0xFE00 <= cp <= 0xFE0F or 0xE0100 <= cp <= 0xE01EF:
         return True
-    if 0x1F3FB <= cp <= 0x1F3FF:  # Emoji Fitzpatrick skin tone modifiers
+    if 0x1F3FB <= cp <= 0x1F3FF:
         return True
-    if cp in (0x200D, 0x20E3):  # Zero-Width Joiner (ZWJ) & Combining Enclosing Keycap
+    if cp in (0x200D, 0x20E3):
         return True
-    cat = unicodedata.category(ch)
-    return cat in ("Mn", "Mc", "Me")
+    return unicodedata.category(ch) in ("Mn", "Mc", "Me")
 
 
 def _is_regional_indicator(ch: str) -> bool:
@@ -97,16 +98,14 @@ def iter_graphemes(text: str) -> Iterator[tuple[int, int, str]]:
         ch = text[i]
         i += 1
 
-        # ธงชาติ (Regional Indicator 2 ตัวติดกัน เช่น 🇹🇭)
         if _is_regional_indicator(ch) and i < n and _is_regional_indicator(text[i]):
             i += 1
             yield start, i, text[start:i]
             continue
 
-        # รวมสระบน/ล่าง วรรณยุกต์ และตัวเชื่อมอีโมจิ (ZWJ) เข้าเป็นก้อนเดียวกัน
         while i < n:
             nxt = text[i]
-            if nxt == "\u200d":  # ZWJ ดึงตัวถัดไปมารวมในอีโมจิเดียวกัน
+            if nxt == "\u200d":
                 i += 1
                 if i < n:
                     i += 1
@@ -146,6 +145,103 @@ def col_from_cell(plain: str, cell_x: int) -> int:
     return len(plain)
 
 
+def layout_rich_text_rows(text: Text, wrap_width: int | None = None) -> list[tuple[int, int, Text]]:
+    """แบ่ง Rich Text เป็นบรรทัดย่อย (รองรับทั้งขึ้นบรรทัดใหม่ของ JSON และการตัดบรรทัดอัตโนมัติ)"""
+    plain = text.plain
+    if not plain:
+        return [(0, 0, Text(" "))]
+
+    # แยกตาม \n ก่อน (สำหรับ JSON ที่คลี่เป็นหลายบรรทัด)
+    segments: list[tuple[int, int]] = []
+    start = 0
+    for idx, ch in enumerate(plain):
+        if ch == "\n":
+            segments.append((start, idx))
+            start = idx + 1
+    segments.append((start, len(plain)))
+
+    rows: list[tuple[int, int, Text]] = []
+    for seg_start, seg_end in segments:
+        if seg_start == seg_end:
+            rows.append((seg_start, seg_end, Text(" ")))
+            continue
+        if wrap_width is None or wrap_width <= 1:
+            rows.append((seg_start, seg_end, text[seg_start:seg_end]))
+            continue
+
+        # ตัดบรรทัดตามความกว้างช่องโดยไม่ตัดสระไทยหรืออีโมจิขาดครึ่ง
+        sub_plain = plain[seg_start:seg_end]
+        cur_start = seg_start
+        cur_w = 0
+        for g_s, g_e, cluster in iter_graphemes(sub_plain):
+            abs_s = seg_start + g_s
+            abs_e = seg_start + g_e
+            w = max(cell_len(cluster), 1) if cluster.strip() else cell_len(cluster)
+            if cur_w + w > wrap_width and cur_start < abs_s:
+                rows.append((cur_start, abs_s, text[cur_start:abs_s]))
+                cur_start = abs_s
+                cur_w = 0
+            cur_w += w
+        if cur_start < seg_end:
+            rows.append((cur_start, seg_end, text[cur_start:seg_end]))
+
+    return rows or [(0, len(plain), text)]
+
+
+# ---------------------------------------------------------------- Filter & JSON Helpers
+def parse_filter_query(query: str) -> tuple[list[str], list[str]]:
+    """แยกคำค้นหาปกติ (includes) และคำที่ขึ้นต้นด้วย ! เพื่อซ่อน (excludes)"""
+    q = query.strip()
+    if not q:
+        return [], []
+    try:
+        tokens = shlex.split(q)
+    except ValueError:
+        tokens = q.split()
+
+    includes: list[str] = []
+    excludes: list[str] = []
+    for tok in tokens:
+        if tok.startswith("!") and len(tok) > 1:
+            excludes.append(tok[1:].lower())
+        elif tok != "!":
+            includes.append(tok.lower())
+    return includes, excludes
+
+
+def expand_json_in_text(clean: str) -> tuple[str, bool]:
+    """ตรวจจับ JSON Object/Array ในบรรทัดแล้วคลี่จัดย่อหน้าให้อ่านง่าย"""
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(clean):
+        if ch not in "{[":
+            continue
+        try:
+            parsed, end_idx = decoder.raw_decode(clean, idx)
+        except Exception:
+            continue
+        if isinstance(parsed, (dict, list)) and len(parsed) > 0 and (end_idx - idx) >= 12:
+            pretty = json.dumps(parsed, ensure_ascii=False, indent=2)
+            prefix_part = clean[:idx].rstrip()
+            suffix_part = clean[end_idx:].strip()
+            combined = f"{prefix_part}\n{pretty}" if prefix_part else pretty
+            if suffix_part:
+                combined = f"{combined}\n{suffix_part}"
+            return combined, True
+    return clean, False
+
+
+def _style_json_block(text: Text, start_offset: int) -> None:
+    """ลงสี Key, String และตัวเลข/Boolean ในบล็อก JSON"""
+    plain = text.plain
+    sub = plain[start_offset:]
+    for m in JSON_KEY_RE.finditer(sub):
+        text.stylize("bold bright_cyan", start_offset + m.start(1), start_offset + m.end(1))
+    for m in JSON_STR_VAL_RE.finditer(sub):
+        text.stylize("green", start_offset + m.start(1), start_offset + m.end(1))
+    for m in JSON_PRIM_VAL_RE.finditer(sub):
+        text.stylize("bold bright_yellow", start_offset + m.start(1), start_offset + m.end(1))
+
+
 # ---------------------------------------------------------------- Text & Log Styling
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
@@ -155,10 +251,9 @@ def clean_line(raw: str) -> str:
     line = raw.rstrip("\r\n")
     if "\r" in line:
         line = line.rsplit("\r", 1)[-1]
-    # ลบอักขระควบคุมที่ทำลายตารางหน้าจอ แต่เก็บอักขระไทยและอีโมจิไว้ครบ
     line = line.replace("\t", "    ").replace("\x00", "")
     return "".join(
-        ch for ch in line if ch == "\x1b" or unicodedata.category(ch) != "Cc"
+        ch for ch in line if ch in ("\x1b", "\n") or unicodedata.category(ch) != "Cc"
     )
 
 
@@ -181,31 +276,43 @@ def _classify_body_style(body: str) -> str:
     return "white"
 
 
-def _highlight_keyword_unicode(text: Text, keyword: str) -> None:
-    """ไฮไลต์คำค้นหาภาษาไทย/อังกฤษ/อีโมจิ แม้พิมพ์ติดกันโดยไม่มีช่องว่าง"""
+def _highlight_keywords_unicode(text: Text, include_terms: list[str]) -> None:
     plain = text.plain
-    if not plain or not keyword:
+    if not plain or not include_terms:
         return
-    for match in re.finditer(re.escape(keyword), plain, flags=re.IGNORECASE):
-        s, e = snap_range_to_graphemes(plain, match.start(), match.end())
-        if e > s:
-            text.stylize("bold black on yellow", s, e)
+    for term in include_terms:
+        if not term:
+            continue
+        for match in re.finditer(re.escape(term), plain, flags=re.IGNORECASE):
+            s, e = snap_range_to_graphemes(plain, match.start(), match.end())
+            if e > s:
+                text.stylize("bold black on yellow", s, e)
 
 
 def style_log_line(
     raw_line: str,
-    keyword: str = "",
+    include_terms: list[str] | None = None,
     prefix: str = "",
     prefix_style: str = "bold cyan",
+    pretty_json: bool = False,
 ) -> Text:
-    """ลงสี Log อัตโนมัติ (รองรับภาษาไทย อีโมจิ สี ANSI และป้ายชื่อแหล่งที่มา)"""
+    """ลงสี Log อัตโนมัติ รองรับภาษาไทย อีโมจิ JSON Pretty-Print และป้ายชื่อแหล่งที่มา"""
     clean = clean_line(raw_line)
-    text = Text()
+    json_expanded = False
+    if pretty_json:
+        plain_for_json = strip_ansi(clean)
+        expanded, ok = expand_json_in_text(plain_for_json)
+        if ok:
+            clean = expanded
+            json_expanded = True
 
+    text = Text()
     if prefix:
         text.append(f"[{prefix}] ", style=prefix_style)
 
-    if "\x1b[" in clean:
+    body_start = len(text.plain)
+
+    if "\x1b[" in clean and not json_expanded:
         text.append_text(Text.from_ansi(NON_SGR_RE.sub("", clean)))
     else:
         rest = clean
@@ -238,13 +345,16 @@ def style_log_line(
                 text.append(lvl_token + " ", style="dim white")
                 text.append(msg_body, style="dim white")
         else:
-            text.append(rest, style=_classify_body_style(rest))
+            text.append(rest, style="white" if json_expanded else _classify_body_style(rest))
+
+        if json_expanded:
+            _style_json_block(text, body_start)
 
     if not text.plain.strip():
         return Text(" ")
 
-    if keyword:
-        _highlight_keyword_unicode(text, keyword)
+    if include_terms:
+        _highlight_keywords_unicode(text, include_terms)
     return text
 
 

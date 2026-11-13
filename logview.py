@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LogViewer - TUI ดู Log สด (รองรับภาษาไทย/อีโมจิ, แบ่ง 4 ช่อง และรวมจากหลาย Terminal)"""
+"""LogViewer - TUI ดู Log สด (รองรับภาษาไทย/อีโมจิ, แบ่ง 4 ช่อง, Exclude Filter, Wrap, JSON, Alert)"""
 import argparse
 import os
 import random
@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +31,7 @@ from log_parser import (
     discover_pm2_apps,
     infer_source_name,
     is_generic_pm2_logs_cmd,
+    parse_filter_query,
     split_lines,
     strip_ansi,
     style_log_line,
@@ -66,6 +68,11 @@ class LogViewerApp(App):
         background: $boost;
         color: $text;
         padding: 0 1;
+    }
+    #status-bar.alert-flash {
+        background: #dc2626;
+        color: #ffffff;
+        text-style: bold;
     }
     #workspace {
         height: 1fr;
@@ -111,6 +118,9 @@ class LogViewerApp(App):
         Binding("space", "toggle_pause", "Pause/Live"),
         Binding("slash", "open_search", "Filter (/)"),
         Binding("e", "toggle_error", "Error Only"),
+        Binding("w", "toggle_wrap", "Wrap"),
+        Binding("j", "toggle_json", "JSON"),
+        Binding("b", "toggle_alert", "Alert"),
         Binding("l", "open_layout_modal", "Layout"),
         Binding("g", "toggle_grid_single", "Grid/1-View"),
         Binding("z", "toggle_zoom", "Zoom"),
@@ -136,6 +146,8 @@ class LogViewerApp(App):
         demo: bool = False,
         initial_layout: str | None = None,
         enable_ipc: bool = True,
+        wrap: bool = False,
+        alert: bool = False,
     ) -> None:
         super().__init__()
         self.initial_specs = initial_specs
@@ -155,7 +167,17 @@ class LogViewerApp(App):
 
         self.paused = False
         self.error_only = False
+        self.wrap_lines = wrap
+        self.pretty_json = False
+        self.alert_enabled = alert
+        self._last_bell_time = 0.0
+        self._last_alert_source = ""
+        self._flash_timer = None
+
         self.keyword = ""
+        self._include_terms: list[str] = []
+        self._exclude_terms: list[str] = []
+
         self._proc_lock = threading.Lock()
         self._ipc_server: IPCServer | None = None
         self._prompt_shown_for_count = 1
@@ -165,7 +187,7 @@ class LogViewerApp(App):
         yield StatusBar("", id="status-bar")
         yield Container(id="workspace")
         yield Input(
-            placeholder="พิมพ์คำค้นหา (ไทย/อังกฤษ/อีโมจิ) แล้วกด Enter (Esc เพื่อล้าง)...",
+            placeholder="พิมพ์คำค้นหา หรือ !คำที่ไม่ต้องการ (เช่น order !ping) แล้วกด Enter (Esc เพื่อล้าง)...",
             id="search-input",
         )
         yield Footer()
@@ -382,7 +404,6 @@ class LogViewerApp(App):
                 env.setdefault("PYTHONIOENCODING", "utf-8")
                 env.setdefault("PYTHONUTF8", "1")
                 if os.name != "nt":
-                    # ป้องกันโปรเซสลูกส่งภาษาไทย/อีโมจิเป็น ASCII ที่พังเป็น ?? หรือ 
                     if "UTF-8" not in env.get("LANG", "").upper():
                         env["LANG"] = "C.UTF-8"
                     if "UTF-8" not in env.get("LC_ALL", "").upper():
@@ -526,9 +547,9 @@ class LogViewerApp(App):
             return
         samples = [
             "INFO  ✅ เชื่อมต่อฐานข้อมูลสำเร็จ (14ms)",
-            "INFO  📱 ส่งแจ้งเตือนออเดอร์ไปยังลูกค้าเรียบร้อย",
+            'INFO  📱 Webhook ออเดอร์ใหม่: {"orderId":"ORD-9021","customer":"สมชาย","amount":450,"status":"paid"}',
             "WARN  ⚠️ หน่วยความจำใช้งานถึง 78% กำลังเคลียร์แคช",
-            "DEBUG Payload verified: checksum=a94f02c",
+            "DEBUG GET /healthcheck 200 OK (ping)",
             "ERROR ❌ เชื่อมต่อ API ภายนอกล้มเหลว (ลองใหม่ 1/3)",
             "INFO  🚀 ประมวลผลคิวงานสำเร็จ 42 รายการ",
         ]
@@ -572,6 +593,7 @@ class LogViewerApp(App):
                     pane_id=src.source_id,
                     title=f"[ZOOM] {src.name} (กด Z เพื่อกลับไปแบ่งช่อง)",
                     show_header=True,
+                    wrap_lines=self.wrap_lines,
                 )
                 workspace.mount(pane)
                 items = [
@@ -582,7 +604,13 @@ class LogViewerApp(App):
                 pane.log_view.set_items(items)
                 pane.log_view.focus()
             else:
-                pane = LogPane(pane_id="combined", title="Combined", show_header=False, classes="no-border")
+                pane = LogPane(
+                    pane_id="combined",
+                    title="Combined",
+                    show_header=False,
+                    wrap_lines=self.wrap_lines,
+                    classes="no-border",
+                )
                 workspace.mount(pane)
                 show_badge = len(self.sources) >= 2
                 items = [
@@ -615,6 +643,7 @@ class LogViewerApp(App):
                     pane_id=src.source_id,
                     title=f"[{idx}] {src.name} ({len(src.lines)} lines)",
                     show_header=True,
+                    wrap_lines=self.wrap_lines,
                     classes=cls,
                 )
                 panes.append(pane)
@@ -674,24 +703,62 @@ class LogViewerApp(App):
         self.focused_source_id = event.pane_id
         self.action_toggle_zoom()
 
-    # ------------------------------------------------------------ Data Drain & Filter
+    # ------------------------------------------------------------ Data Drain, Filter & Alert
     def matches_filter(self, line: str) -> bool:
         plain = strip_ansi(line)
         if self.error_only and not ERROR_RE.search(plain):
             return False
-        if self.keyword and self.keyword.lower() not in plain.lower():
-            return False
+        low = plain.lower()
+        for inc in self._include_terms:
+            if inc not in low:
+                return False
+        for exc in self._exclude_terms:
+            if exc in low:
+                return False
         return True
 
     def _make_item(
         self, seq: int, raw: str, prefix: str = "", prefix_style: str = "bold cyan"
     ) -> tuple[int, Text, str]:
-        text = style_log_line(raw, self.keyword, prefix=prefix, prefix_style=prefix_style)
+        text = style_log_line(
+            raw,
+            include_terms=self._include_terms,
+            prefix=prefix,
+            prefix_style=prefix_style,
+            pretty_json=self.pretty_json,
+        )
         plain = text.plain
         return seq, text, plain if plain.strip() else ""
 
+    def _trigger_error_alert(self, source_name: str) -> None:
+        self._last_alert_source = source_name
+        try:
+            bar = self.query_one("#status-bar", StatusBar)
+            bar.add_class("alert-flash")
+            if self._flash_timer is not None:
+                self._flash_timer.stop()
+            self._flash_timer = self.set_timer(0.9, self._clear_alert_flash)
+        except Exception:
+            pass
+
+        now = time.monotonic()
+        if now - self._last_bell_time >= 2.0:
+            self._last_bell_time = now
+            try:
+                self.bell()
+            except Exception:
+                pass
+
+    def _clear_alert_flash(self) -> None:
+        try:
+            self.query_one("#status-bar", StatusBar).remove_class("alert-flash")
+            self.update_status_bar()
+        except Exception:
+            pass
+
     def _drain_all_incoming(self) -> None:
         any_new = False
+        alert_source: str | None = None
         combined_items: list[tuple[int, Text, str]] = []
         show_badge = len(self.sources) >= 2
 
@@ -715,7 +782,11 @@ class LogViewerApp(App):
                 src.lines.append((seq, raw))
                 self._combined_lines.append((seq, src.name, src.color_style, raw))
 
-                if not self.paused and self.matches_filter(raw):
+                matched = self.matches_filter(raw)
+                if matched and self.alert_enabled and ERROR_RE.search(strip_ansi(raw)):
+                    alert_source = src.name
+
+                if not self.paused and matched:
                     if self._is_multi_pane() or self.zoomed_source_id == src.source_id:
                         per_pane_items.append(self._make_item(seq, raw, prefix=""))
                     elif not self._is_multi_pane() and not self.zoomed_source_id:
@@ -750,6 +821,9 @@ class LogViewerApp(App):
             except Exception:
                 pass
 
+        if alert_source:
+            self._trigger_error_alert(alert_source)
+
         if any_new:
             self.update_status_bar()
 
@@ -762,7 +836,16 @@ class LogViewerApp(App):
         else:
             layout_tag = ""
 
-        mode = " [ERROR ONLY]" if self.error_only else ""
+        flags = ""
+        if self.error_only:
+            flags += " [ERR-ONLY]"
+        if self.wrap_lines:
+            flags += " [WRAP]"
+        if self.pretty_json:
+            flags += " [JSON]"
+        if self.alert_enabled:
+            flags += f" [🔔:{self._last_alert_source}]" if self._last_alert_source else " [🔔]"
+
         filt = f" | Filter: '{self.keyword}'" if self.keyword else ""
         focus_src = self._get_focused_source()
         focus_info = f" | Active: {focus_src.name}" if (focus_src and len(self.sources) >= 2) else ""
@@ -770,7 +853,7 @@ class LogViewerApp(App):
         total = f" | Sources: {len(self.sources)} ({total_lines} lines)"
         try:
             self.query_one("#status-bar", StatusBar).update(
-                f"{state}{layout_tag}{mode}{filt}{focus_info}{total}"
+                f"{state}{layout_tag}{flags}{filt}{focus_info}{total}"
             )
         except Exception:
             pass
@@ -781,6 +864,28 @@ class LogViewerApp(App):
             self.title = f"LogViewer - {self.sources[0].name}"
 
     # ------------------------------------------------------------ Actions & Keybindings
+    def action_toggle_wrap(self) -> None:
+        self.wrap_lines = not self.wrap_lines
+        for view in self.query(LogView):
+            view.set_wrap(self.wrap_lines)
+        self.update_status_bar()
+        self.notify(f"ตัดบรรทัดอัตโนมัติ (Wrap): {'เปิด' if self.wrap_lines else 'ปิด'}", timeout=1.8)
+
+    def action_toggle_json(self) -> None:
+        self.pretty_json = not self.pretty_json
+        self._rebuild_workspace()
+        self.notify(f"คลี่ข้อความ JSON: {'เปิด' if self.pretty_json else 'ปิด'}", timeout=1.8)
+
+    def action_toggle_alert(self) -> None:
+        self.alert_enabled = not self.alert_enabled
+        if not self.alert_enabled:
+            self._last_alert_source = ""
+        self.update_status_bar()
+        self.notify(
+            f"แจ้งเตือนเสียง/กะพริบเมื่อเจอ Error: {'เปิด' if self.alert_enabled else 'ปิด'}",
+            timeout=2,
+        )
+
     def action_open_layout_modal(self) -> None:
         if len(self.sources) < 2:
             self.notify("ต้องมี Log อย่างน้อย 2 ตัวขึ้นไปจึงจะแบ่งช่องได้", timeout=2)
@@ -970,6 +1075,7 @@ class LogViewerApp(App):
                 src.lines.clear()
                 src.incoming.clear()
             self._combined_lines.clear()
+        self._last_alert_source = ""
         self._rebuild_workspace()
 
     def action_open_search(self) -> None:
@@ -980,6 +1086,7 @@ class LogViewerApp(App):
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.keyword = event.value.strip()
+        self._include_terms, self._exclude_terms = parse_filter_query(self.keyword)
         event.input.remove_class("visible")
         self._rebuild_workspace()
 
@@ -990,6 +1097,7 @@ class LogViewerApp(App):
         if search_box.has_focus:
             search_box.value = ""
             self.keyword = ""
+            self._include_terms, self._exclude_terms = [], []
             search_box.remove_class("visible")
             self._rebuild_workspace()
             event.stop()
@@ -1050,6 +1158,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="กำหนดรูปแบบหน้าจอทันทีโดยไม่ต้องถาม (grid4 / auto / single)",
     )
+    parser.add_argument("--wrap", action="store_true", help="เปิดการตัดบรรทัดอัตโนมัติตั้งแต่เริ่มต้น")
+    parser.add_argument("--alert", action="store_true", help="เปิดเสียงและไฟแจ้งเตือนเมื่อเจอ Error")
     parser.add_argument("--new", action="store_true", help="บังคับเปิดหน้าต่างใหม่แยกต่างหาก")
     parser.add_argument("--demo", action="store_true", help="โหมดสาธิต")
     return parser.parse_args(argv)
@@ -1143,6 +1253,8 @@ if __name__ == "__main__":
             demo=cli.demo,
             initial_layout=cli.layout,
             enable_ipc=not cli.new,
+            wrap=cli.wrap,
+            alert=cli.alert,
         ).run()
     finally:
         cleanup_pipe_writers(pipe_inode)

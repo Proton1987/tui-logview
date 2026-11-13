@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""วิดเจ็ตแสดง Log แบบ Virtual Scroll และระบบช่องแยก (LogPane) รองรับสระซ้อนภาษาไทยและอีโมจิ"""
+"""วิดเจ็ตแสดง Log แบบ Virtual Scroll รองรับ Line Wrap, JSON หลายบรรทัด, ภาษาไทยและอีโมจิ"""
 import bisect
 from rich.text import Text
 from textual import events
@@ -16,6 +16,7 @@ from log_parser import (
     MAX_BUFFER_LINES,
     WORD_RE,
     col_from_cell,
+    layout_rich_text_rows,
     snap_range_to_graphemes,
 )
 
@@ -33,7 +34,7 @@ class PaneHeader(Static):
 
 
 class LogView(ScrollView, can_focus=True):
-    """พื้นที่แสดงผล Log แบบ Virtual Rendering พร้อมระบบลากคลุมข้อความ"""
+    """พื้นที่แสดงผล Log แบบ Virtual Rendering พร้อม Line Wrap และลากคลุมข้อความ"""
 
     allow_select = False
 
@@ -58,13 +59,17 @@ class LogView(ScrollView, can_focus=True):
             super().__init__()
             self.pane_id = pane_id
 
-    def __init__(self, pane_id: str = "main", **kwargs) -> None:
+    def __init__(self, pane_id: str = "main", wrap_lines: bool = False, **kwargs) -> None:
         super().__init__(**kwargs)
         self.pane_id = pane_id
+        self.wrap_lines = wrap_lines
         self._ids: list[int] = []
         self._texts: list[Text] = []
         self._copy: list[str] = []
+        # แถวที่แสดงจริงบนจอ: (logical_idx, char_start, char_end, visual_text)
+        self._vrows: list[tuple[int, int, int, Text]] = []
         self._max_cells = 1
+        self._last_wrap_width = 0
         self.follow = True
         self._anchor: tuple[int, int] | None = None
         self._cursor: tuple[int, int] | None = None
@@ -75,30 +80,73 @@ class LogView(ScrollView, can_focus=True):
         self._drag_timer = None
         self._edge_ticks = 0
 
+    def _effective_wrap_width(self) -> int | None:
+        if not self.wrap_lines:
+            return None
+        w = self.size.width or self._last_wrap_width
+        return w if w > 1 else None
+
     def _sync_size(self) -> None:
-        self.virtual_size = Size(max(self._max_cells, 1), len(self._texts))
+        width = max(self.size.width, 1) if self.wrap_lines else max(self._max_cells, 1)
+        self.virtual_size = Size(width, len(self._vrows))
+
+    def _rebuild_vrows(self) -> None:
+        wrap_w = self._effective_wrap_width()
+        self._vrows = []
+        self._max_cells = 1
+        for idx, text in enumerate(self._texts):
+            for c_start, c_end, vtext in layout_rich_text_rows(text, wrap_w):
+                self._vrows.append((idx, c_start, c_end, vtext))
+                if vtext.cell_len > self._max_cells:
+                    self._max_cells = vtext.cell_len
+        self._sync_size()
+        if self.follow and not self._dragging:
+            self.scroll_end(animate=False)
+        self.refresh()
+
+    def set_wrap(self, enabled: bool) -> None:
+        if self.wrap_lines != enabled:
+            self.wrap_lines = enabled
+            if enabled:
+                self.scroll_to(x=0, animate=False)
+            self._rebuild_vrows()
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self.wrap_lines and event.size.width != self._last_wrap_width:
+            self._last_wrap_width = event.size.width
+            self._rebuild_vrows()
 
     def add_items(self, items: list[tuple[int, Text, str]]) -> None:
         if not items:
             return
+        wrap_w = self._effective_wrap_width()
         for seq, text, copy in items:
+            logical_idx = len(self._ids)
             self._ids.append(seq)
             self._texts.append(text)
             self._copy.append(copy)
-            if text.cell_len > self._max_cells:
-                self._max_cells = text.cell_len
+            for c_start, c_end, vtext in layout_rich_text_rows(text, wrap_w):
+                self._vrows.append((logical_idx, c_start, c_end, vtext))
+                if vtext.cell_len > self._max_cells:
+                    self._max_cells = vtext.cell_len
+
         removed = len(self._ids) - MAX_BUFFER_LINES
         if removed > 0:
+            old_vlen = len(self._vrows)
             del self._ids[:removed]
             del self._texts[:removed]
             del self._copy[:removed]
+            self._rebuild_vrows()
+            removed_vrows = max(0, old_vlen - len(self._vrows))
+            if removed_vrows > 0 and not self.follow:
+                self._adjusting = True
+                try:
+                    self.scroll_to(y=max(0, self.scroll_y - removed_vrows), animate=False)
+                finally:
+                    self._adjusting = False
+            return
+
         self._sync_size()
-        if removed > 0 and not self.follow:
-            self._adjusting = True
-            try:
-                self.scroll_to(y=max(0, self.scroll_y - removed), animate=False)
-            finally:
-                self._adjusting = False
         if self.follow and not self._dragging:
             self.scroll_end(animate=False)
         self.refresh()
@@ -107,14 +155,10 @@ class LogView(ScrollView, can_focus=True):
         self._ids = [i[0] for i in items]
         self._texts = [i[1] for i in items]
         self._copy = [i[2] for i in items]
-        self._max_cells = max((t.cell_len for t in self._texts), default=1)
-        self._sync_size()
-        if self.follow:
-            self.scroll_end(animate=False)
-        self.refresh()
+        self._rebuild_vrows()
 
     def clear(self) -> None:
-        self._ids, self._texts, self._copy = [], [], []
+        self._ids, self._texts, self._copy, self._vrows = [], [], [], []
         self._max_cells = 1
         self._anchor = self._cursor = None
         self.stop_drag()
@@ -161,26 +205,30 @@ class LogView(ScrollView, can_focus=True):
         scroll_x, scroll_y = self.scroll_offset
         width = self.size.width
         row = scroll_y + y
-        if row >= len(self._texts):
+        if row >= len(self._vrows):
             return Strip.blank(width, self.rich_style)
 
-        text = self._texts[row]
+        logical_idx, c_start, c_end, text = self._vrows[row]
         sel = self._selection_range()
         if sel is not None:
             (i1, c1), (i2, c2) = sel
-            if i1 <= row <= i2:
-                plain = text.plain
-                total = len(plain)
-                start = c1 if row == i1 else 0
-                end = c2 if row == i2 else total
-                start, end = min(start, total), min(end, total)
-                start, end = snap_range_to_graphemes(plain, start, end)
-                if end > start:
+            if i1 <= logical_idx <= i2:
+                full_plain = self._texts[logical_idx].plain
+                total = len(full_plain)
+                line_start = c1 if logical_idx == i1 else 0
+                line_end = c2 if logical_idx == i2 else total
+                line_start, line_end = min(line_start, total), min(line_end, total)
+                line_start, line_end = snap_range_to_graphemes(full_plain, line_start, line_end)
+
+                ov_start = max(line_start, c_start)
+                ov_end = min(line_end, c_end)
+                if ov_end > ov_start:
                     text = text.copy()
-                    text.stylize(SELECTION_STYLE, start, end)
+                    text.stylize(SELECTION_STYLE, ov_start - c_start, ov_end - c_start)
 
         strip = Strip(list(text.render(self.app.console)))
-        strip = strip.crop_extend(scroll_x, scroll_x + width, self.rich_style)
+        sx = 0 if self.wrap_lines else scroll_x
+        strip = strip.crop_extend(sx, sx + width, self.rich_style)
         return strip.apply_style(self.rich_style)
 
     @property
@@ -213,14 +261,17 @@ class LogView(ScrollView, can_focus=True):
         return "\n".join(parts)
 
     def _pos_at(self, x: float, y: float) -> tuple[int, int] | None:
-        n = len(self._ids)
+        n = len(self._vrows)
         if n == 0:
             return None
         height = max(self.size.height, 1)
         vy = min(max(int(y), 0), height - 1)
-        idx = min(self.scroll_offset.y + vy, n - 1)
-        col = col_from_cell(self._texts[idx].plain, int(x) + self.scroll_offset.x)
-        return self._ids[idx], col
+        vrow_idx = min(self.scroll_offset.y + vy, n - 1)
+        logical_idx, c_start, c_end, vtext = self._vrows[vrow_idx]
+        sx = 0 if self.wrap_lines else self.scroll_offset.x
+        local_col = col_from_cell(vtext.plain, int(x) + sx)
+        col = min(c_start + local_col, c_end)
+        return self._ids[logical_idx], col
 
     def _update_cursor_from_pointer(self) -> None:
         pos = self._pos_at(self._last_x, self._last_y)
@@ -339,16 +390,29 @@ class LogPane(Vertical):
             super().__init__()
             self.pane_id = pane_id
 
-    def __init__(self, pane_id: str, title: str, show_header: bool = True, **kwargs) -> None:
+    def __init__(
+        self,
+        pane_id: str,
+        title: str,
+        show_header: bool = True,
+        wrap_lines: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.pane_id = pane_id
         self.pane_title = title
         self.show_header = show_header
+        self.wrap_lines = wrap_lines
 
     def compose(self) -> ComposeResult:
         if self.show_header:
             yield PaneHeader(self.pane_title, id=f"hdr-{self.pane_id}", classes="pane-header")
-        yield LogView(pane_id=self.pane_id, id=f"view-{self.pane_id}", classes="pane-logview")
+        yield LogView(
+            pane_id=self.pane_id,
+            wrap_lines=self.wrap_lines,
+            id=f"view-{self.pane_id}",
+            classes="pane-logview",
+        )
 
     @property
     def log_view(self) -> LogView:
