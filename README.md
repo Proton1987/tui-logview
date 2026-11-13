@@ -1,24 +1,31 @@
-# LogViewer (`tui-logview`)
+<div align="center">
 
-โปรแกรมดู Log แบบเรียลไทม์บน Terminal (TUI) พัฒนาด้วย Python และ [Textual](https://github.com/Textualize/textual) รองรับทั้ง Linux และ Windows ออกแบบมาเพื่อการดู Log จากหลายโปรเซสพร้อมกัน คัดลอกข้อความง่าย และรองรับภาษาไทยกับอีโมจิเต็มรูปแบบ
+# 🖥️ LogViewer (`tui-logview`)
 
----
+**โปรแกรมดู Log สดบน Terminal (TUI) แบบแบ่งหลายหน้าต่าง รองรับภาษาไทย อีโมจิ และรวมจอข้าม Terminal**
 
-## ความสามารถหลัก
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
+![Textual](https://img.shields.io/badge/TUI-Textual-blueviolet)
+![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-* **รองรับแหล่งข้อมูลหลากหลาย:** อ่านไฟล์ Log (`tail -f`), รับข้อมูลผ่านท่อ Pipe (`|`), สั่งรันโปรเซสโดยตรง (`--run`) และดึงโปรเซสทั้งหมดจาก PM2 อัตโนมัติ (`--pm2`)
-* **แบ่งหน้าจอหลายช่อง (Split Grid):** เมื่อเปิด Log ตั้งแต่ 2 ตัวขึ้นไป จะมีหน้าต่างถามเลือกรูปแบบการแสดงผล (แบ่ง 4 ช่อง `2x2`, แบ่งตามจำนวน หรือรวมหน้าจอเดียว) และสลับเปลี่ยนได้ตลอดเวลา
-* **รวมหน้าต่างข้าม Terminal (Cross-Terminal IPC):** หากเปิด `logview` ค้างไว้แล้ว เมื่อสั่งเปิดไฟล์หรือคำสั่งใหม่จากอีกหน้าต่าง Terminal ข้อมูลจะถูกส่งมารวมในหน้าจอเดิมทันทีโดยไม่เปิดซ้อนให้เปลืองทรัพยากร
-* **ลงสี Log อัตโนมัติ:** รองรับทั้งสี ANSI จากต้นทาง และการแยกสีอัตโนมัติตามระดับข้อความ (`ERR`, `WARN`, `INF`, `OK`, เวลา ISO8601, แท็ก `[...]`, คำแจ้งเตือนภาษาไทย และสัญลักษณ์อีโมจิ)
-* **รองรับภาษาไทยและอีโมจิสมบูรณ์:** จัดกลุ่มพยัญชนะ สระลอย วรรณยุกต์ และอีโมจิผสม (Grapheme Clustering) ทำให้ลากเมาส์คลุม ดับเบิลคลิก หรือค้นหาคำภาษาไทยได้แม่นยำโดยสระไม่แหว่ง
-* **คัดลอกลง Clipboard ทันที:** ลากเมาส์คลุมข้อความเพื่อคัดลอกอัตโนมัติ (รองรับทั้ง Windows Win32 API, Linux `xclip`/`wl-copy`/`xsel`, macOS `pbcopy` และ OSC 52 ผ่าน SSH)
+</div>
 
 ---
 
-## การติดตั้ง
+## ✨ ภาพรวมหน้าจอ (ตัวอย่างโหมดแบ่ง 4 ช่อง)
 
-### Linux (Debian / Ubuntu) — คำสั่งเดียวจบ
-สคริปต์ `install.sh` จะติดตั้ง `python3-venv`, `xclip`, ฟอนต์ภาษาไทยและอีโมจิ (`fonts-thai-tlwg`, `fonts-noto-color-emoji`), สร้าง Virtual Environment และสร้างคำสั่งลัดกลาง `/usr/local/bin/logview` ให้อัตโนมัติ:
-
-```bash
-git clone [https://github.com/Proton1987/tui-logview.git](https://github.com/Proton1987/tui-logview.git) ~/tui-logview && bash ~/tui-logview/install.sh
+```text
+┌────────────────────────────────────────────────────────────────────────────┐
+│ LogViewer (4 sources)                                             09:15:42 │
+│ ● LIVE [GRID] | Active: line-bot | Sources: 4 (1,240 lines)                │
+├─────────────────────────────────────┬──────────────────────────────────────┤
+│ [1] thlive-bot (412 lines)          │ [2] line-bot (528 lines)             │
+│ 09:15:40 INF ✅ เชื่อมต่อห้องสำเร็จ  │ 09:15:41 [telegram] ERR Bad Request  │
+│ 09:15:41 INF 📩 ส่งข้อความเรียบร้อย  │ 09:15:42 WRN ⚠️ ลองส่งซ้ำแบบข้อความดิบ  │
+├─────────────────────────────────────┼──────────────────────────────────────┤
+│ [3] cf-tunnel (150 lines)           │ [4] cf-tunnel-2 (150 lines)          │
+│ 09:15:30 INF Registered tunnel sin17│ 09:15:35 INF Registered tunnel bkk06 │
+└─────────────────────────────────────┴──────────────────────────────────────┘
+│ Space Pause/Live  / Filter  e Error Only  l Layout  g Grid/1-View  q Quit  │
+└────────────────────────────────────────────────────────────────────────────┘
