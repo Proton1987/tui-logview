@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+log_export_*.log
+test_logger.py
+test_logger.js
+app.log
