@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""LogViewer - TUI ดู Log สด (รองรับแบ่ง 4 ช่อง + รวมจอจากหลาย Terminal)
-
-ตัวอย่างใช้งาน:
-    logview app.log
-    logview app1.log app2.log app3.log app4.log
-    logview --pm2
-    logview -r "pm2 logs --raw"
-    logview -r "pm2 logs line-bot --raw" -r "pm2 logs thlive-bot --raw"
-"""
+"""LogViewer - TUI ดู Log สด (รองรับภาษาไทย/อีโมจิ, แบ่ง 4 ช่อง และรวมจากหลาย Terminal)"""
 import argparse
 import os
 import random
@@ -52,8 +44,6 @@ INCOMING_LIMIT = 100_000
 
 @dataclass
 class SourceStream:
-    """เก็บข้อมูลและสถานะของ Log แต่ละแหล่ง"""
-
     source_id: str
     name: str
     kind: str  # "file" | "run" | "pipe" | "ipc_pipe" | "demo"
@@ -159,7 +149,6 @@ class LogViewerApp(App):
         self._seq = 0
         self._combined_lines: deque[tuple[int, str, str, str]] = deque(maxlen=MAX_BUFFER_LINES)
 
-        # โหมดหน้าจอ: "single" (รวม 1 ช่อง) | "grid4" (4 ช่อง) | "auto" (แบ่งตามจำนวน)
         self.layout_mode: str = initial_layout or "single"
         self.zoomed_source_id: str | None = None
         self.focused_source_id: str | None = None
@@ -171,13 +160,12 @@ class LogViewerApp(App):
         self._ipc_server: IPCServer | None = None
         self._prompt_shown_for_count = 1
 
-    # ------------------------------------------------------------ Compose & Mount
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         yield StatusBar("", id="status-bar")
         yield Container(id="workspace")
         yield Input(
-            placeholder="พิมพ์คำค้นหาแล้วกด Enter (กด Esc เพื่อล้างตัวกรอง)...",
+            placeholder="พิมพ์คำค้นหา (ไทย/อังกฤษ/อีโมจิ) แล้วกด Enter (Esc เพื่อล้าง)...",
             id="search-input",
         )
         yield Footer()
@@ -187,7 +175,6 @@ class LogViewerApp(App):
             self._ipc_server = IPCServer(self._on_ipc_message)
             self._ipc_server.start()
 
-        # สร้างแหล่งข้อมูลเริ่มต้น
         if self.initial_specs:
             for spec in self.initial_specs:
                 self._create_source(
@@ -220,7 +207,6 @@ class LogViewerApp(App):
         self.set_interval(DRAIN_INTERVAL, self._drain_all_incoming)
         self.set_interval(0.2, self._poll_all_files)
 
-        # ถ้าเปิดมาพร้อม 2+ แหล่งข้อมูล ให้เด้งกล่องถามรูปแบบหน้าจอทันที
         if len(self.sources) >= 2 and not self.forced_layout:
             self._prompt_shown_for_count = len(self.sources)
             self.call_after_refresh(self.action_open_layout_modal)
@@ -289,7 +275,6 @@ class LogViewerApp(App):
 
         self._rebuild_workspace()
 
-        # เมื่อมีการเปิดเพิ่มจากอีก Terminal จนกลายเป็น 2+ ตัว ให้เด้งกล่องถามแบ่งหน้าจอ
         if prompt_if_multi and len(self.sources) >= 2 and len(self.sources) > self._prompt_shown_for_count:
             self._prompt_shown_for_count = len(self.sources)
             self.action_open_layout_modal()
@@ -312,19 +297,12 @@ class LogViewerApp(App):
             src.sock = None
 
     def _on_ipc_message(self, msg: dict, conn: socket.socket | None) -> None:
-        """รับคำสั่งเปิด Log เพิ่มจากอีก Terminal"""
         action = msg.get("action")
         if action == "file":
             path = msg.get("path", "")
             if path:
                 self.call_from_thread(
-                    self._handle_ipc_add,
-                    "file",
-                    path,
-                    msg.get("name"),
-                    "",
-                    None,
-                    b"",
+                    self._handle_ipc_add, "file", path, msg.get("name"), "", None, b""
                 )
         elif action == "run":
             cmd = msg.get("cmd", "")
@@ -347,13 +325,7 @@ class LogViewerApp(App):
                             )
                         return
                 self.call_from_thread(
-                    self._handle_ipc_add,
-                    "run",
-                    cmd,
-                    msg.get("name"),
-                    cwd,
-                    None,
-                    b"",
+                    self._handle_ipc_add, "run", cmd, msg.get("name"), cwd, None, b""
                 )
         elif action == "stream_pipe" and conn is not None:
             self.call_from_thread(
@@ -408,6 +380,14 @@ class LogViewerApp(App):
                 env.setdefault("FORCE_COLOR", "1")
                 env.setdefault("PYTHONUNBUFFERED", "1")
                 env.setdefault("PYTHONIOENCODING", "utf-8")
+                env.setdefault("PYTHONUTF8", "1")
+                if os.name != "nt":
+                    # ป้องกันโปรเซสลูกส่งภาษาไทย/อีโมจิเป็น ASCII ที่พังเป็น ?? หรือ 
+                    if "UTF-8" not in env.get("LANG", "").upper():
+                        env["LANG"] = "C.UTF-8"
+                    if "UTF-8" not in env.get("LC_ALL", "").upper():
+                        env["LC_ALL"] = "C.UTF-8"
+
                 kwargs = {
                     "shell": True,
                     "stdin": subprocess.DEVNULL,
@@ -545,12 +525,12 @@ class LogViewerApp(App):
         if not src.active:
             return
         samples = [
-            "INFO  Worker #1 connected to database successfully",
-            "INFO  GET /api/status 200 OK (14ms)",
-            "WARN  Memory usage reached 78%, running garbage collection",
+            "INFO  ✅ เชื่อมต่อฐานข้อมูลสำเร็จ (14ms)",
+            "INFO  📱 ส่งแจ้งเตือนออเดอร์ไปยังลูกค้าเรียบร้อย",
+            "WARN  ⚠️ หน่วยความจำใช้งานถึง 78% กำลังเคลียร์แคช",
             "DEBUG Payload verified: checksum=a94f02c",
-            "ERROR Connection timeout while reaching upstream gateway (retry 1/3)",
-            "INFO  Task queue processed 42 jobs",
+            "ERROR ❌ เชื่อมต่อ API ภายนอกล้มเหลว (ลองใหม่ 1/3)",
+            "INFO  🚀 ประมวลผลคิวงานสำเร็จ 42 รายการ",
         ]
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         src.incoming.append(f"{now} {random.choice(samples)}\n")
@@ -585,7 +565,6 @@ class LogViewerApp(App):
             return
 
         if not self._is_multi_pane():
-            # โหมด 1 ช่อง (รวมทุกแหล่ง หรือ Zoom เฉพาะตัวเดียว)
             workspace.styles.layout = "vertical"
             if self.zoomed_source_id:
                 src = self._visible_sources()[0]
@@ -619,7 +598,6 @@ class LogViewerApp(App):
                 pane.log_view.set_items(items)
                 pane.log_view.focus()
         else:
-            # โหมดแบ่งช่อง Grid (2, 3 หรือ 4 ช่อง)
             visible = self._visible_sources()
             count = len(visible)
             cols = 2
@@ -1054,7 +1032,7 @@ def setup_piped_stdin():
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="logview",
-        description="TUI Log Viewer (รองรับแบ่ง 4 ช่อง และรวมจากหลาย Terminal)",
+        description="TUI Log Viewer (รองรับภาษาไทย/อีโมจิ, แบ่ง 4 ช่อง และรวมจากหลาย Terminal)",
     )
     parser.add_argument("files", nargs="*", help="ไฟล์ Log ที่ต้องการเปิด (ระบุได้หลายไฟล์)")
     parser.add_argument(
@@ -1128,7 +1106,6 @@ if __name__ == "__main__":
 
     has_pipe = not sys.stdin.isatty() and not specs and not cli.demo
 
-    # ถ้ามีหน้าต่าง logview เปิดอยู่แล้ว (และไม่ได้สั่ง --new) ให้ส่งข้อมูลเข้าไปรวมในจอเดิมทันที
     if not cli.new and not cli.demo:
         ipc_payloads = []
         for s in specs:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""วิดเจ็ตแสดง Log แบบ Virtual Scroll และระบบช่องแยก (LogPane)"""
+"""วิดเจ็ตแสดง Log แบบ Virtual Scroll และระบบช่องแยก (LogPane) รองรับสระซ้อนภาษาไทยและอีโมจิ"""
 import bisect
 from rich.text import Text
 from textual import events
@@ -12,7 +12,12 @@ from textual.scroll_view import ScrollView
 from textual.strip import Strip
 from textual.widgets import Static
 
-from log_parser import MAX_BUFFER_LINES, WORD_RE, col_from_cell
+from log_parser import (
+    MAX_BUFFER_LINES,
+    WORD_RE,
+    col_from_cell,
+    snap_range_to_graphemes,
+)
 
 AUTOSCROLL_HZ = 30
 AUTOSCROLL_MAX_LINES = 12
@@ -164,10 +169,12 @@ class LogView(ScrollView, can_focus=True):
         if sel is not None:
             (i1, c1), (i2, c2) = sel
             if i1 <= row <= i2:
-                total = len(text.plain)
+                plain = text.plain
+                total = len(plain)
                 start = c1 if row == i1 else 0
                 end = c2 if row == i2 else total
                 start, end = min(start, total), min(end, total)
+                start, end = snap_range_to_graphemes(plain, start, end)
                 if end > start:
                     text = text.copy()
                     text.stylize(SELECTION_STYLE, start, end)
@@ -191,10 +198,18 @@ class LogView(ScrollView, can_focus=True):
             return ""
         (i1, c1), (i2, c2) = sel
         if i1 == i2:
-            return self._copy[i1][c1:c2]
-        parts = [self._copy[i1][c1:]]
-        parts.extend(self._copy[i1 + 1:i2])
-        parts.append(self._copy[i2][:c2])
+            line = self._copy[i1]
+            s, e = snap_range_to_graphemes(line, c1, c2)
+            return line[s:e]
+
+        first_line = self._copy[i1]
+        s1, _ = snap_range_to_graphemes(first_line, c1, len(first_line))
+        last_line = self._copy[i2]
+        _, e2 = snap_range_to_graphemes(last_line, 0, c2)
+
+        parts = [first_line[s1:]]
+        parts.extend(self._copy[i1 + 1 : i2])
+        parts.append(last_line[:e2])
         return "\n".join(parts)
 
     def _pos_at(self, x: float, y: float) -> tuple[int, int] | None:
@@ -290,7 +305,8 @@ class LogView(ScrollView, can_focus=True):
         if chain == 2:
             for m in WORD_RE.finditer(plain):
                 if m.start() <= pos[1] <= m.end():
-                    self._anchor, self._cursor = (pos[0], m.start()), (pos[0], m.end())
+                    s, e = snap_range_to_graphemes(plain, m.start(), m.end())
+                    self._anchor, self._cursor = (pos[0], s), (pos[0], e)
                     break
             else:
                 return
