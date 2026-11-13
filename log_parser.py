@@ -11,6 +11,9 @@ import sys
 import threading
 import time
 import unicodedata
+import zlib
+from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterator
 
 if "NO_COLOR" not in os.environ:
@@ -38,11 +41,6 @@ WORD_RE = re.compile(r"[\w\u0E00-\u0E7F./:\-@\\]+", re.UNICODE)
 
 TS_RE = re.compile(
     r"^(\[?\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?|\[?\d{2}:\d{2}:\d{2}(?:\.\d+)?\]?)\s*(.*)"
-)
-TAG_RE = re.compile(r"^(\[[^\]\r\n]{1,32}\])\s*(.*)")
-LEVEL_RE = re.compile(
-    r"^(ERR(?:OR)?|FATAL|CRITICAL|WRN|WARN(?:ING)?|INF(?:O)?|DBG|DEBUG)\b\s*(.*)",
-    re.I,
 )
 
 ERROR_RE = re.compile(
@@ -264,16 +262,225 @@ def split_lines(text: str) -> list[str]:
     return [p + "\n" for p in parts]
 
 
-def _classify_body_style(body: str) -> str:
-    if ERROR_RE.search(body):
-        return "bold red"
+# ---- ระดับ (level) และป้าย (tag) ที่แสดงหน้าทุกบรรทัด
+LEVEL_WORDS = {
+    "ERR": "ERR", "ERROR": "ERR", "FATAL": "ERR", "CRITICAL": "ERR", "CRIT": "ERR", "SEVERE": "ERR",
+    "WRN": "WARN", "WARN": "WARN", "WARNING": "WARN",
+    "INF": "INFO", "INFO": "INFO", "NOTICE": "INFO",
+    "DBG": "DBG", "DEBUG": "DBG", "TRACE": "DBG", "VERBOSE": "DBG",
+}
+BRACKET_RE = re.compile(r"^\[([^\]\r\n]{1,32})\]\s*(.*)$", re.S)
+LEVEL_BARE_RE = re.compile(
+    r"^(ERR(?:OR)?|FATAL|CRITICAL|CRIT|SEVERE|WRN|WARN(?:ING)?|INF(?:O)?|NOTICE|DBG|DEBUG|TRACE|VERBOSE)"
+    r"\b(\s*[:\-–|]\s*|\s+)(.*)$",
+    re.I | re.S,
+)
+PM2_PREFIX_RE = re.compile(r"^(\d+)\|([A-Za-z0-9_.\-]{1,40})\s*\|\s?(.*)$", re.S)
+PM2_HEADER_RE = re.compile(
+    r"^(?:.*[\\/])?([^\\/\s]+?)(?:-(out|error))?\.log\s+last\s+(\d+)\s+lines:?\s*$", re.I
+)
+
+STOP_RE = re.compile(
+    r"\b(?:SIGINT|SIGTERM|SIGKILL|SIGHUP)\b|shutting down|\bshutdown\b|stream ended|stream closed"
+    r"|exited with code 0\b|กำลังปิด|ปิดระบบ|ก่อนปิด",
+    re.I,
+)
+READY_RE = re.compile(
+    r"\bserver\s+(?:is\s+)?(?:running|started|listening|ready)\b"
+    r"|\b(?:running|listening|started|ready)\s+(?:on|at)\s+(?:port\s*)?\d+"
+    r"|เซิร์ฟเวอร์.{0,12}(?:ทำงาน|เริ่ม|พร้อม)",
+    re.I,
+)
+NO_ERROR_RE = re.compile(
+    r"\b(?:no|0|zero|without)\s+errors?\b|\berrors?\s*[=:]\s*0\b|ไม่มี\s*(?:ข้อผิดพลาด|error)", re.I
+)
+
+# กฎเดาป้ายเมื่อบรรทัดไม่มีป้ายของตัวเอง: เรียงจากเฉพาะเจาะจงไปทั่วไป และเดาเฉพาะที่มั่นใจ
+TAG_RULES: list[tuple[str, re.Pattern]] = [
+    (tag, re.compile(pattern, re.I))
+    for tag, pattern in (
+        ("boot", r"\b(?:SIGINT|SIGTERM|SIGKILL|SIGHUP)\b|shutting down|\bshutdown\b|\bgraceful(?:ly)?\b"
+                 r"|\brestart(?:ing|ed)?\b|\bbooting\b|\bstartup\b|กำลังปิด|ปิดระบบ|รีสตาร์ท|เริ่มต้นระบบ"),
+        ("http", r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/\S*|\bHTTP/\d(?:\.\d)?\b"
+                 r"|\b[1-5]\d\d\s+(?:OK|Created|No Content|Not Found|Bad Request|Unauthorized|Forbidden"
+                 r"|Internal Server Error)\b|\bstatus(?:\s*code)?\s*[:=]\s*[1-5]\d\d\b"),
+        ("server", r"\bserver\b|\blistening\s+on\b|\b(?:running|started|ready|listening)\s+(?:on|at)\s+"
+                   r"(?:port\s*)?\d+|\bport\s+\d{2,5}\b|เซิร์ฟเวอร์|พอร์ต\s*\d+"),
+        ("webhook", r"webhook|เว็บฮุก|เว็บฮุค"),
+        ("db", r"\b(?:supabase|postgres(?:ql)?|mysql|mariadb|mongo(?:db)?|redis|sqlite|prisma|sequelize"
+               r"|database|sql|query|transaction)\b|ฐานข้อมูล"),
+        ("auth", r"\b(?:login|logout|auth(?:entication|orization)?|jwt|oauth|unauthori[sz]ed|forbidden"
+                 r"|permission)\b|เข้าสู่ระบบ|ออกจากระบบ|สิทธิ์"),
+        ("media", r"\b(?:yt-dlp|ffmpeg|youtube|download(?:ing|ed)?|upload(?:ing|ed)?|transcod\w+)\b"
+                  r"|ดาวน์โหลด|อัปโหลด"),
+        ("job", r"\b(?:queue|job|jobs|worker|cron|schedul\w+|task)\b|คิว"),
+        ("order", r"\b(?:order|payment|invoice|checkout|paid|refund)\b|ออเดอร์|คำสั่งซื้อ|ชำระเงิน"),
+        ("sys", r"\b(?:memory|heap|cpu|disk|gc|garbage|cache)\b|หน่วยความจำ|แคช"),
+        ("net", r"\b(?:ECONN\w+|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket|websocket|timeout|timed out|dns|proxy"
+                r"|connection|connect(?:ed|ing)?|disconnect\w*|api|request|fetch|retry\w*)\b"
+                r"|เชื่อมต่อ|หมดเวลา|ลองใหม่"),
+        ("file", r"\b(?:ENOENT|EACCES|EISDIR|file|directory)\b|ไฟล์|โฟลเดอร์"),
+        ("proc", r"\bprocess\b|\bpid\b|โปรเซส"),
+    )
+]
+DEFAULT_TAG = "app"
+
+LEVEL_LABEL = {
+    # ระดับ: (ข้อความป้าย, สีป้าย, สีเนื้อความ)
+    "ERR": ("ERR", "bold red", "bold red"),
+    "WARN": ("WARN", "bold yellow", "yellow"),
+    "STOP": ("STOP", "bold yellow", "yellow"),
+    "OK": ("OK", "bold green", "green"),
+    "INFO": ("INFO", "bold cyan", "white"),
+    "DBG": ("DBG", "dim white", "dim white"),
+}
+TAG_COLORS = [
+    "magenta", "cyan", "green", "yellow", "blue",
+    "bright_magenta", "bright_cyan", "bright_green", "bright_blue", "orange3",
+]
+GUTTER_LEVEL_W = 6   # "INFO  "
+GUTTER_TAG_W = 10    # "[server]  "
+
+
+@dataclass(frozen=True)
+class ParsedLine:
+    ts: str
+    level: str
+    level_explicit: bool
+    tag: str
+    tag_explicit: bool
+    body: str
+    origin: str = ""
+    meta: bool = False
+
+
+def classify_level(body: str) -> str:
+    """ระดับจากเนื้อหา: ERR > WARN > STOP > OK > DBG > INFO"""
+    if ERROR_RE.search(NO_ERROR_RE.sub(" ", body)):
+        return "ERR"
     if WARN_RE.search(body):
-        return "bold yellow"
-    if OK_RE.search(body):
-        return "green"
+        return "WARN"
+    if STOP_RE.search(body):
+        return "STOP"
+    if OK_RE.search(body) or READY_RE.search(body):
+        return "OK"
     if DEBUG_RE.search(body):
-        return "dim white"
-    return "white"
+        return "DBG"
+    return "INFO"
+
+
+def infer_tag(body: str) -> str:
+    for tag, rx in TAG_RULES:
+        if rx.search(body):
+            return tag
+    return DEFAULT_TAG
+
+
+def _looks_like_tag(inner: str) -> bool:
+    if len(inner) > 24 or len(inner.split()) > 2:
+        return False
+    return bool(re.search(r"[A-Za-z฀-๿]", inner))
+
+
+@lru_cache(maxsize=8192)
+def parse_log_line(plain: str) -> ParsedLine:
+    """แยกบรรทัดเป็น เวลา / ระดับ / ป้าย / เนื้อความ (ไม่แก้ข้อความจริง ยกเว้นตัดป้ายที่ย้ายไปแสดงหน้าบรรทัด)"""
+    header = PM2_HEADER_RE.match(plain.strip())
+    if header:
+        name, stream, count = header.group(1), (header.group(2) or "").lower(), header.group(3)
+        kind = {"out": " · stdout", "error": " · stderr"}.get(stream, "")
+        return ParsedLine(
+            "", "INFO", False, "pm2", False,
+            f"── {name}{kind} · last {count} lines ──", meta=True,
+        )
+
+    s, origin = plain, ""
+    pm = PM2_PREFIX_RE.match(s)
+    if pm:
+        origin, s = pm.group(2), pm.group(3)
+
+    ts = ""
+    tm = TS_RE.match(s)
+    if tm:
+        ts, s = tm.group(1), tm.group(2)
+
+    level_raw: str | None = None
+    tag = ""
+    for _ in range(4):
+        bm = BRACKET_RE.match(s)
+        if bm:
+            inner, rest = bm.group(1).strip(), bm.group(2)
+            lv = LEVEL_WORDS.get(inner.upper())
+            if lv is not None:
+                level_raw = level_raw or lv
+                s = rest
+                continue
+            if not tag and _looks_like_tag(inner):
+                tag, s = inner, rest
+                continue
+            break
+        if level_raw is None:
+            lm = LEVEL_BARE_RE.match(s)
+            if lm:
+                word, sep, rest = lm.group(1), lm.group(2), lm.group(3)
+                if word.isupper():          # "ERROR msg" -> ตัดคำระดับไปแสดงเป็นป้าย
+                    level_raw = LEVEL_WORDS[word.upper()]
+                    s = rest
+                    continue
+                if ":" in sep:              # "Error: msg" -> คงข้อความไว้ แต่ใช้เป็นระดับ
+                    level_raw = LEVEL_WORDS[word.upper()]
+                    break
+        break
+
+    body = s.strip()
+    if level_raw in ("ERR", "WARN", "DBG"):
+        level = level_raw
+    else:  # INFO ที่ระบุเอง หรือไม่ได้ระบุ -> ดูจากเนื้อหา (INFO ที่มีคำว่า error ในเนื้อหายังเป็น ERR)
+        level = classify_level(body)
+
+    return ParsedLine(
+        ts=ts,
+        level=level,
+        level_explicit=level_raw is not None,
+        tag=tag or infer_tag(body),
+        tag_explicit=bool(tag),
+        body=body,
+        origin=origin,
+    )
+
+
+def plain_of(raw: str) -> str:
+    return strip_ansi(clean_line(raw))
+
+
+def line_level(raw: str) -> str:
+    """ระดับของบรรทัด (ERR/WARN/STOP/OK/INFO/DBG) ใช้ร่วมกันทั้งการแสดงผล ตัวกรอง Error และ Alert"""
+    plain = plain_of(raw)
+    return parse_log_line(plain).level if plain.strip() else "INFO"
+
+
+def filter_haystack(raw: str) -> str:
+    """ข้อความสำหรับค้นหา: เนื้อหา + ระดับ + ป้าย (ค้นคำว่า server / warn / db ได้ตรงกับที่เห็น)"""
+    plain = plain_of(raw)
+    if not plain.strip():
+        return plain.lower()
+    p = parse_log_line(plain)
+    return f"{plain}\n{p.level} {p.tag}".lower()
+
+
+def _tag_color(tag: str) -> str:
+    return TAG_COLORS[zlib.crc32(tag.lower().encode("utf-8")) % len(TAG_COLORS)]
+
+
+def _append_gutter(text: Text, parsed: ParsedLine) -> None:
+    """ช่องหน้าบรรทัด: ระดับ (6 ช่อง) + ป้าย (10 ช่อง) ให้คอลัมน์ตรงกันทุกบรรทัด"""
+    label, badge_style, _ = LEVEL_LABEL[parsed.level]
+    text.append(label.ljust(GUTTER_LEVEL_W), style=badge_style)
+    color = _tag_color(parsed.tag)
+    tag_txt = f"[{parsed.tag}]"
+    # ป้ายที่บรรทัดระบุเอง = ตัวหนา / ป้ายที่ระบบเดาให้ = ตัวเอียง
+    style = f"bold {color}" if parsed.tag_explicit else f"italic {color}"
+    text.append(tag_txt + " " * max(1, GUTTER_TAG_W - cell_len(tag_txt)), style=style)
 
 
 def _highlight_keywords_unicode(text: Text, include_terms: list[str]) -> None:
@@ -296,62 +503,47 @@ def style_log_line(
     prefix_style: str = "bold cyan",
     pretty_json: bool = False,
 ) -> Text:
-    """ลงสี Log อัตโนมัติ รองรับภาษาไทย อีโมจิ JSON Pretty-Print และป้ายชื่อแหล่งที่มา"""
+    """ลงสี Log: [แหล่ง] เวลา  ระดับ  [ป้าย]  เนื้อความ  (รองรับไทย อีโมจิ JSON และสี ANSI จากต้นทาง)"""
     clean = clean_line(raw_line)
+    plain = strip_ansi(clean)
+    if not plain.strip():
+        return Text(" ")
+
+    parsed = parse_log_line(plain)
+    has_ansi = "\x1b[" in clean
+
+    body = parsed.body
     json_expanded = False
-    if pretty_json:
-        plain_for_json = strip_ansi(clean)
-        expanded, ok = expand_json_in_text(plain_for_json)
+    if pretty_json and not parsed.meta:
+        expanded, ok = expand_json_in_text(body)
         if ok:
-            clean = expanded
-            json_expanded = True
+            body, json_expanded = expanded, True
 
     text = Text()
     if prefix:
         text.append(f"[{prefix}] ", style=prefix_style)
 
-    body_start = len(text.plain)
-
-    if "\x1b[" in clean and not json_expanded:
+    if has_ansi and not json_expanded and not parsed.meta:
+        # ต้นทางลงสีมาเอง: คงสีต้นฉบับ และเติมช่องหน้าบรรทัดเฉพาะบรรทัดที่ยังไม่มีเวลา/ระดับ/ป้ายเลย
+        if not (parsed.ts or parsed.tag_explicit or parsed.level_explicit or parsed.origin):
+            _append_gutter(text, parsed)
         text.append_text(Text.from_ansi(NON_SGR_RE.sub("", clean)))
     else:
-        rest = clean
-        ts_match = TS_RE.match(rest)
-        if ts_match:
-            text.append(ts_match.group(1) + " ", style="dim cyan")
-            rest = ts_match.group(2)
-
-        tag_match = TAG_RE.match(rest)
-        if tag_match:
-            text.append(tag_match.group(1) + " ", style="bold magenta")
-            rest = tag_match.group(2)
-
-        lvl_match = LEVEL_RE.match(rest)
-        if lvl_match:
-            lvl_token = lvl_match.group(1)
-            msg_body = lvl_match.group(2)
-            lvl_upper = lvl_token.upper()
-
-            if lvl_upper.startswith(("ERR", "FATAL", "CRIT")):
-                text.append(lvl_token + " ", style="bold red")
-                text.append(msg_body, style="bold red")
-            elif lvl_upper.startswith("W"):
-                text.append(lvl_token + " ", style="bold yellow")
-                text.append(msg_body, style="yellow")
-            elif lvl_upper.startswith("I"):
-                text.append(lvl_token + " ", style="bold cyan")
-                text.append(msg_body, style=_classify_body_style(msg_body))
-            else:
-                text.append(lvl_token + " ", style="dim white")
-                text.append(msg_body, style="dim white")
+        if parsed.origin:
+            text.append(f"{parsed.origin} ", style="dim")
+        if parsed.ts:
+            text.append(parsed.ts + " ", style="dim cyan")
+        _append_gutter(text, parsed)
+        body_start = len(text.plain)
+        if parsed.meta:
+            body_style = "dim italic"
+        elif json_expanded:
+            body_style = "white"
         else:
-            text.append(rest, style="white" if json_expanded else _classify_body_style(rest))
-
+            body_style = LEVEL_LABEL[parsed.level][2]
+        text.append(body, style=body_style)
         if json_expanded:
             _style_json_block(text, body_start)
-
-    if not text.plain.strip():
-        return Text(" ")
 
     if include_terms:
         _highlight_keywords_unicode(text, include_terms)

@@ -59,8 +59,17 @@ class LogView(ScrollView, can_focus=True):
             super().__init__()
             self.pane_id = pane_id
 
-    def __init__(self, pane_id: str = "main", wrap_lines: bool = False, **kwargs) -> None:
+    def __init__(
+        self,
+        pane_id: str = "main",
+        wrap_lines: bool = False,
+        initial_items: list | None = None,
+        focus_on_mount: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
+        self._initial_items = initial_items
+        self._focus_on_mount = focus_on_mount
         self.pane_id = pane_id
         self.wrap_lines = wrap_lines
         self._ids: list[int] = []
@@ -80,6 +89,13 @@ class LogView(ScrollView, can_focus=True):
         self._drag_timer = None
         self._edge_ticks = 0
 
+    def on_mount(self) -> None:
+        if self._initial_items is not None:
+            items, self._initial_items = self._initial_items, None
+            self.set_items(items)
+        if self._focus_on_mount:
+            self.call_after_refresh(self.focus)
+
     def _effective_wrap_width(self) -> int | None:
         if not self.wrap_lines:
             return None
@@ -87,7 +103,8 @@ class LogView(ScrollView, can_focus=True):
         return w if w > 1 else None
 
     def _sync_size(self) -> None:
-        width = max(self.size.width, 1) if self.wrap_lines else max(self._max_cells, 1)
+        # โหมด Wrap ไม่เลื่อนแนวนอน: กว้าง 1 เพื่อไม่ให้ขึ้นแถบเลื่อนแนวนอนเกินจำเป็น
+        width = 1 if self.wrap_lines else max(self._max_cells, 1)
         self.virtual_size = Size(width, len(self._vrows))
 
     def _rebuild_vrows(self) -> None:
@@ -396,6 +413,8 @@ class LogPane(Vertical):
         title: str,
         show_header: bool = True,
         wrap_lines: bool = False,
+        initial_items: list | None = None,
+        focus_on_mount: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -403,13 +422,18 @@ class LogPane(Vertical):
         self.pane_title = title
         self.show_header = show_header
         self.wrap_lines = wrap_lines
+        self._initial_items = initial_items
+        self._focus_on_mount = focus_on_mount
 
     def compose(self) -> ComposeResult:
         if self.show_header:
             yield PaneHeader(self.pane_title, id=f"hdr-{self.pane_id}", classes="pane-header")
+        items, self._initial_items = self._initial_items, None
         yield LogView(
             pane_id=self.pane_id,
             wrap_lines=self.wrap_lines,
+            initial_items=items,
+            focus_on_mount=self._focus_on_mount,
             id=f"view-{self.pane_id}",
             classes="pane-logview",
         )

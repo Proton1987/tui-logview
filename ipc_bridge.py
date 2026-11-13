@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """ระบบเชื่อมต่อข้าม Terminal (เปิด logview จากหน้าต่างอื่นให้เด้งมารวมในหน้าต่างที่เปิดอยู่)"""
+import hmac
 import json
 import os
 import secrets
@@ -23,8 +24,12 @@ def _read_state() -> dict | None:
 def _write_state(port: int, token: str) -> None:
     data = {"pid": os.getpid(), "port": port, "token": token}
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
+        # สิทธิ์ 600: token นี้สั่งรันคำสั่งบนเครื่องได้ ห้ามให้ผู้ใช้อื่นอ่าน
+        fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        if os.name != "nt":
+            os.chmod(STATE_FILE, 0o600)
     except Exception:
         pass
 
@@ -140,7 +145,7 @@ class IPCServer:
 
             line, rest = buf.split(b"\n", 1)
             msg = json.loads(line.decode("utf-8", errors="replace"))
-            if msg.get("token") != self.token:
+            if not hmac.compare_digest(str(msg.get("token", "")), self.token):
                 conn.close()
                 return
 

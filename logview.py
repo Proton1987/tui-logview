@@ -22,18 +22,18 @@ from textual.widgets import Footer, Header, Input
 from ipc_bridge import IPCServer, try_forward_to_existing
 from log_parser import (
     BADGE_PALETTE,
-    ERROR_RE,
     MAX_BUFFER_LINES,
     READ_CHUNK_BYTES,
     TAIL_BYTES,
     cleanup_pipe_writers,
     copy_to_clipboard_cross_platform,
     discover_pm2_apps,
+    filter_haystack,
     infer_source_name,
     is_generic_pm2_logs_cmd,
+    line_level,
     parse_filter_query,
     split_lines,
-    strip_ansi,
     style_log_line,
     terminate_process_tree,
 )
@@ -394,7 +394,7 @@ class LogViewerApp(App):
             terminate_process_tree(old_proc)
 
         now = datetime.now().strftime("%H:%M:%S")
-        src.incoming.append(f"[{now}] INFO  Starting: {src.target}\n")
+        src.incoming.append(f"[{now}] INFO  [viewer] Starting: {src.target}\n")
 
         def _worker() -> None:
             try:
@@ -442,10 +442,10 @@ class LogViewerApp(App):
                 if gen == src.proc_gen and src.active:
                     end_time = datetime.now().strftime("%H:%M:%S")
                     level = "INFO " if code == 0 else "ERROR"
-                    src.incoming.append(f"[{end_time}] {level} Process exited with code {code}\n")
+                    src.incoming.append(f"[{end_time}] {level} [viewer] Process exited with code {code}\n")
             except Exception as e:
                 if gen == src.proc_gen and src.active:
-                    src.incoming.append(f"[ERROR] รันคำสั่งไม่สำเร็จ: {e}\n")
+                    src.incoming.append(f"[ERROR] [viewer] รันคำสั่งไม่สำเร็จ: {e}\n")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -456,7 +456,7 @@ class LogViewerApp(App):
                     break
                 src.incoming.append(line)
             if src.active:
-                src.incoming.append("[INFO] Stream ended (EOF)\n")
+                src.incoming.append("[INFO] [viewer] Stream ended (EOF)\n")
         except Exception:
             pass
 
@@ -476,7 +476,7 @@ class LogViewerApp(App):
                     break
                 buf += chunk
             if src.active:
-                src.incoming.append("[INFO] Remote stream closed\n")
+                src.incoming.append("[INFO] [viewer] Remote stream closed\n")
         except Exception:
             pass
         finally:
@@ -488,7 +488,7 @@ class LogViewerApp(App):
     def _load_initial_tail_for(self, src: SourceStream) -> None:
         path = src.target
         if not path or not os.path.exists(path):
-            src.incoming.append(f"[WARN] กำลังรอไฟล์: {path} ...\n")
+            src.incoming.append(f"[WARN] [viewer] กำลังรอไฟล์: {path} ...\n")
             return
         try:
             size = os.path.getsize(path)
@@ -497,7 +497,7 @@ class LogViewerApp(App):
                 f.seek(start)
                 data = f.read(size - start)
         except OSError as e:
-            src.incoming.append(f"[ERROR] เปิดไฟล์ไม่ได้: {e}\n")
+            src.incoming.append(f"[ERROR] [viewer] เปิดไฟล์ไม่ได้: {e}\n")
             return
 
         if start > 0:
@@ -527,7 +527,7 @@ class LogViewerApp(App):
                 size = os.path.getsize(path)
                 if size < src.file_pos:
                     src.file_pos = 0
-                    src.incoming.append("[INFO] ไฟล์ถูกรีเซ็ต อ่านใหม่จากต้นไฟล์\n")
+                    src.incoming.append("[INFO] [viewer] ไฟล์ถูกรีเซ็ต อ่านใหม่จากต้นไฟล์\n")
                 if size == src.file_pos:
                     continue
                 with open(path, "rb") as f:
@@ -585,33 +585,27 @@ class LogViewerApp(App):
             self.update_status_bar()
             return
 
+        # ใส่ข้อมูลเริ่มต้นผ่าน LogPane(initial_items=...) เพราะ widget ลูกยังไม่ถูกสร้างทันทีหลัง mount()
         if not self._is_multi_pane():
             workspace.styles.layout = "vertical"
             if self.zoomed_source_id:
                 src = self._visible_sources()[0]
-                pane = LogPane(
-                    pane_id=src.source_id,
-                    title=f"[ZOOM] {src.name} (กด Z เพื่อกลับไปแบ่งช่อง)",
-                    show_header=True,
-                    wrap_lines=self.wrap_lines,
-                )
-                workspace.mount(pane)
                 items = [
                     self._make_item(seq, raw, prefix="")
                     for seq, raw in src.lines
                     if self.matches_filter(raw)
                 ]
-                pane.log_view.set_items(items)
-                pane.log_view.focus()
-            else:
-                pane = LogPane(
-                    pane_id="combined",
-                    title="Combined",
-                    show_header=False,
-                    wrap_lines=self.wrap_lines,
-                    classes="no-border",
+                workspace.mount(
+                    LogPane(
+                        pane_id=src.source_id,
+                        title=f"[ZOOM] {src.name} (กด Z เพื่อกลับไปแบ่งช่อง)",
+                        show_header=True,
+                        wrap_lines=self.wrap_lines,
+                        initial_items=items,
+                        focus_on_mount=True,
+                    )
                 )
-                workspace.mount(pane)
+            else:
                 show_badge = len(self.sources) >= 2
                 items = [
                     self._make_item(
@@ -623,8 +617,17 @@ class LogViewerApp(App):
                     for seq, sname, scolor, raw in self._combined_lines
                     if self.matches_filter(raw)
                 ]
-                pane.log_view.set_items(items)
-                pane.log_view.focus()
+                workspace.mount(
+                    LogPane(
+                        pane_id="combined",
+                        title="Combined",
+                        show_header=False,
+                        wrap_lines=self.wrap_lines,
+                        classes="no-border",
+                        initial_items=items,
+                        focus_on_mount=True,
+                    )
+                )
         else:
             visible = self._visible_sources()
             count = len(visible)
@@ -636,30 +639,30 @@ class LogViewerApp(App):
             workspace.styles.grid_size_rows = rows
             workspace.styles.grid_gutter = (0, 1)
 
+            focus_id = (
+                self.focused_source_id
+                if any(s.source_id == self.focused_source_id for s in visible)
+                else visible[0].source_id
+            )
             panes: list[LogPane] = []
             for idx, src in enumerate(visible, start=1):
-                cls = "focused-pane" if src.source_id == self.focused_source_id else ""
-                pane = LogPane(
-                    pane_id=src.source_id,
-                    title=f"[{idx}] {src.name} ({len(src.lines)} lines)",
-                    show_header=True,
-                    wrap_lines=self.wrap_lines,
-                    classes=cls,
-                )
-                panes.append(pane)
-
-            workspace.mount_all(panes)
-            for src, pane in zip(visible, panes):
                 items = [
                     self._make_item(seq, raw, prefix="")
                     for seq, raw in src.lines
                     if self.matches_filter(raw)
                 ]
-                pane.log_view.set_items(items)
-
-            active_pane = self._get_focused_pane()
-            if active_pane:
-                active_pane.log_view.focus()
+                panes.append(
+                    LogPane(
+                        pane_id=src.source_id,
+                        title=f"[{idx}] {src.name} ({len(src.lines)} lines)",
+                        show_header=True,
+                        wrap_lines=self.wrap_lines,
+                        classes="focused-pane" if src.source_id == self.focused_source_id else "",
+                        initial_items=items,
+                        focus_on_mount=(src.source_id == focus_id),
+                    )
+                )
+            workspace.mount_all(panes)
 
         self.update_status_bar()
 
@@ -705,10 +708,11 @@ class LogViewerApp(App):
 
     # ------------------------------------------------------------ Data Drain, Filter & Alert
     def matches_filter(self, line: str) -> bool:
-        plain = strip_ansi(line)
-        if self.error_only and not ERROR_RE.search(plain):
+        if not (self.error_only or self._include_terms or self._exclude_terms):
+            return True
+        if self.error_only and line_level(line) != "ERR":
             return False
-        low = plain.lower()
+        low = filter_haystack(line)
         for inc in self._include_terms:
             if inc not in low:
                 return False
@@ -783,7 +787,7 @@ class LogViewerApp(App):
                 self._combined_lines.append((seq, src.name, src.color_style, raw))
 
                 matched = self.matches_filter(raw)
-                if matched and self.alert_enabled and ERROR_RE.search(strip_ansi(raw)):
+                if matched and self.alert_enabled and line_level(raw) == "ERR":
                     alert_source = src.name
 
                 if not self.paused and matched:
@@ -1015,19 +1019,21 @@ class LogViewerApp(App):
             self.notify("ลากเมาส์คลุมข้อความก่อน หรือกด a เพื่อคัดลอกทั้งหมด", timeout=2.5)
 
     def _active_plain_lines(self) -> list[str]:
+        """ข้อความเหมือนที่เห็นบนจอ (ระดับ + ป้าย + เนื้อความ) ตามตัวกรองปัจจุบัน"""
         if self._is_multi_pane() or self.zoomed_source_id:
             src = self._get_focused_source()
             if not src:
                 return []
             return [
-                strip_ansi(ln.rstrip("\r\n"))
+                style_log_line(ln, pretty_json=self.pretty_json).plain
                 for _, ln in src.lines
                 if self.matches_filter(ln)
             ]
+        show_badge = len(self.sources) >= 2
         return [
-            f"[{sname}] {strip_ansi(ln.rstrip(chr(13) + chr(10)))}"
-            if len(self.sources) >= 2
-            else strip_ansi(ln.rstrip("\r\n"))
+            style_log_line(
+                ln, prefix=sname if show_badge else "", pretty_json=self.pretty_json
+            ).plain
             for _, sname, _, ln in self._combined_lines
             if self.matches_filter(ln)
         ]
